@@ -1,6 +1,11 @@
 import { getPage, getContext, productCache, setLastSearchContext } from '../browser.js';
 import { ensureLoggedIn } from '../auth.js';
 import { formatProductInfo, extractProductPageInfoFromHtml, extractReviewsFromHtml, formatReviews } from './helpers.js';
+import {
+  scoreSearchResults,
+  formatScoredResults,
+  type ScoringCriteria,
+} from './scoring.js';
 import type { Product, SearchResultItem } from '../types.js';
 
 export async function searchProducts(query: string, topN: number = 5): Promise<string> {
@@ -192,6 +197,132 @@ export async function getProductInfo(query: string): Promise<string> {
     return formatProductInfo(product);
   } catch (err) {
     return `❌ Failed to extract product info: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/**
+ * Search Frisco for `query`, then rank the visible results against
+ * `criteria` (must/avoid/preferKeywords + unit-price/pack-size/availability
+ * weights). Returns a formatted markdown-ish block; also caches the
+ * Product entries under their names so follow-up tools can use them.
+ *
+ * Scoring details live in src/tools/scoring.ts and are unit-tested in
+ * src/__tests__/scoring.test.ts. This wrapper performs the same DOM
+ * scrape as `searchProducts`, then hands raw items to the pure scorer.
+ */
+export async function searchProductsScored(
+  query: string,
+  criteria: ScoringCriteria,
+  topN: number = 5,
+): Promise<string> {
+  const page = await getPage();
+  const context = await getContext();
+  await ensureLoggedIn(page, context);
+
+  await page.getByRole('textbox', { name: 'Wyszukaj' }).click();
+  const searchInput = page.getByRole('textbox', { name: 'Jakiego produktu szukasz?' });
+  await searchInput.fill(query);
+  await searchInput.press('Enter');
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForTimeout(2_000);
+
+  // We over-scrape (default 25) so the scorer has a real candidate set;
+  // the scorer + topN trim to user-visible size.
+  const candidatePoolSize = 25;
+
+  try {
+    const products = (await page.evaluate((limit: number) => {
+      function notInSidebar(el: HTMLElement) {
+        let node = el.parentElement;
+        while (node) {
+          const cls = (node.className || '').toString().toLowerCase();
+          if (cls.includes('cart') || cls.includes('basket') || cls.includes('mini-cart')) return false;
+          node = node.parentElement;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.left <= window.innerWidth * 0.65;
+      }
+
+      const boxes = Array.from(document.querySelectorAll<HTMLElement>('.product-box_holder'))
+        .filter(el => el.offsetParent !== null && notInSidebar(el))
+        .slice(0, limit);
+
+      return boxes.map(box => {
+        const nameEl = box.querySelector<HTMLAnchorElement>('a[title]');
+        const name = nameEl ? nameEl.title : '?';
+        const productLink = box.querySelector<HTMLAnchorElement>('a[href*="/pid,"][title]');
+        const href = productLink ? productLink.getAttribute('href') || productLink.href : null;
+        const priceEl = box.querySelector<HTMLElement>('[class*="price"], [class*="Price"]');
+        const price = priceEl ? priceEl.innerText.trim().replace(/\s+/g, ' ') : '';
+
+        let weight = '';
+        const weightEl = box.querySelector<HTMLElement>('.f-pc-weight__text');
+        if (weightEl) {
+          const raw = weightEl.innerText.trim().replace(/\s+/g, ' ');
+          const wm = raw.match(/^~?([\d.,]+\s*(?:g|ml|kg|l|szt\.?|pcs)\b)/i);
+          if (wm) weight = wm[1];
+        }
+        if (!weight) {
+          const imgEl = box.querySelector<HTMLImageElement>('img[alt]');
+          if (imgEl?.alt) {
+            const am = imgEl.alt.match(/([\d.,]+\s*(?:g|ml|kg|l|szt\.?|pcs))\s*$/i);
+            if (am) weight = am[1].replace(/ /g, ' ');
+          }
+        }
+
+        const unavailable = !!box.querySelector('.unavailable-info') ||
+          !!box.querySelector('article.unavailable');
+
+        return { name, href, price, weight, available: !unavailable };
+      });
+    }, candidatePoolSize)) as Array<{
+      name: string;
+      href: string | null;
+      price: string;
+      weight: string;
+      available: boolean;
+    }>;
+
+    if (!products.length) return `❌ No products found for: "${query}"`;
+
+    const searchResults: SearchResultItem[] = [];
+    const searchUrl = page.url();
+
+    for (const p of products) {
+      const fullUrl = typeof p.href === 'string'
+        ? (p.href.startsWith('http') ? p.href : `https://www.frisco.pl${p.href}`)
+        : null;
+      if (p.available && fullUrl) {
+        const cachedProduct: Product = {
+          name: p.name,
+          url: fullUrl,
+          price: p.price || '',
+          weight: p.weight || null,
+          macros: {},
+          ingredients: null,
+        };
+        productCache.set(p.name, cachedProduct);
+      }
+      searchResults.push({
+        name: p.name,
+        url: fullUrl,
+        price: p.price || '',
+        weight: p.weight || '',
+        available: p.available,
+      });
+    }
+    setLastSearchContext({
+      query,
+      searchUrl,
+      results: searchResults,
+      updatedAt: Date.now(),
+    });
+
+    const scored = scoreSearchResults(searchResults, criteria);
+    const formatted = formatScoredResults(query, scored, topN);
+    return `${formatted}\n\n🔗 Search URL: ${searchUrl}`;
+  } catch (err) {
+    return `❌ Search error: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 

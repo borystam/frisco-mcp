@@ -17,11 +17,17 @@ interface LogEntry {
 const DATA_DIR = join(homedir(), ".frisco-mcp");
 const LOG_DIR = join(DATA_DIR, "logs");
 
+// Owner-only permissions: logs may contain tool inputs/outputs that include
+// product URLs, queries, and other personal-shopping context.
+const DIR_MODE = 0o700;
+const FILE_MODE = 0o600;
+
 let initialized = false;
 let seq = 0;
 let sessionId = "";
 let sessionLogPath = "";
 let writeQueue: Promise<void> = Promise.resolve();
+let chmodAttemptedForCurrentFile = false;
 
 function buildSessionId(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -32,8 +38,14 @@ async function enqueueWrite(line: string): Promise<void> {
   writeQueue = writeQueue
     .catch(() => undefined)
     .then(async () => {
-    await fs.mkdir(LOG_DIR, { recursive: true });
-    await fs.appendFile(sessionLogPath, line, "utf-8");
+      await fs.mkdir(LOG_DIR, { recursive: true, mode: DIR_MODE });
+      await fs.appendFile(sessionLogPath, line, { encoding: "utf-8", mode: FILE_MODE });
+      if (!chmodAttemptedForCurrentFile) {
+        try {
+          await fs.chmod(sessionLogPath, FILE_MODE);
+        } catch {}
+        chmodAttemptedForCurrentFile = true;
+      }
     });
   await writeQueue;
 }
@@ -42,9 +54,15 @@ export async function initLogger(): Promise<void> {
   if (initialized) return;
   sessionId = buildSessionId();
   sessionLogPath = join(LOG_DIR, `${sessionId}.jsonl`);
-  await fs.mkdir(LOG_DIR, { recursive: true });
+  chmodAttemptedForCurrentFile = false;
+  await fs.mkdir(LOG_DIR, { recursive: true, mode: DIR_MODE });
+  try {
+    await fs.chmod(DATA_DIR, DIR_MODE);
+    await fs.chmod(LOG_DIR, DIR_MODE);
+  } catch {}
+  const currentSessionPath = join(DATA_DIR, "current-session.json");
   await fs.writeFile(
-    join(DATA_DIR, "current-session.json"),
+    currentSessionPath,
     JSON.stringify(
       {
         sessionId,
@@ -54,8 +72,11 @@ export async function initLogger(): Promise<void> {
       null,
       2,
     ),
-    "utf-8",
+    { encoding: "utf-8", mode: FILE_MODE },
   );
+  try {
+    await fs.chmod(currentSessionPath, FILE_MODE);
+  } catch {}
   initialized = true;
   await logEvent("session_started", { sessionLogPath });
 }

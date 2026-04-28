@@ -14,9 +14,12 @@ import {
 } from "./tools/cart.js";
 import {
   searchProducts,
+  searchProductsScored,
   getProductInfo,
   getProductReviews,
 } from "./tools/products.js";
+import { getDeliverySlots } from "./tools/delivery.js";
+import { getOrderHistory } from "./tools/orders.js";
 import {
   initLogger,
   logEvent,
@@ -186,7 +189,21 @@ server.registerTool(
   },
   async ({ items, clearCartFirst }) => {
     return executeTool("add_items_to_cart", { items, clearCartFirst }, () =>
-      addItemsToCart(items, { clearCartFirst }),
+      addItemsToCart(items, {
+        clearCartFirst,
+        // Per-item progress: emits one log line as each cart item resolves,
+        // so a long batch (15+ items) shows movement instead of going silent.
+        onProgress: (event) => {
+          void logEvent("cart_item_progress", {
+            index: event.index,
+            total: event.total,
+            status: event.status,
+            name: event.item.name ?? null,
+            quantity: event.item.quantity ?? 1,
+            messagePreview: event.message.slice(0, 200),
+          });
+        },
+      }),
     );
   },
 );
@@ -207,6 +224,102 @@ server.registerTool(
   async ({ query, topN }) => {
     return executeTool("search_products", { query, topN }, () =>
       searchProducts(query, topN),
+    );
+  },
+);
+
+server.registerTool(
+  "search_products_scored",
+  {
+    description:
+      "Searches frisco.pl for products and ranks the top hits by user-supplied criteria. Each result has a 0-100 score with a per-criterion breakdown and a one-line reason. Use this when you want the best match for a query under explicit constraints (must/avoid keywords, lowest unit price, target pack size, prefer-keywords).",
+    inputSchema: {
+      query: z.string().describe("Product name to search for"),
+      topN: z.number().default(5).describe("Number of scored results to return (default 5)"),
+      must: z
+        .array(z.string())
+        .optional()
+        .describe("Required substrings in the product name (case-insensitive). Items missing any of these score 0."),
+      avoid: z
+        .array(z.string())
+        .optional()
+        .describe("Forbidden substrings in the product name (case-insensitive). Items containing any of these score 0."),
+      preferKeywords: z
+        .array(z.string())
+        .optional()
+        .describe("Bonus keywords; partial matches add weight to the keyword component."),
+      unitPriceWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Weight (0-1) for unit-price (PLN/kg or PLN/L) component. Default 0.4."),
+      packSizeWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Weight (0-1) for pack-size proximity to targetWeightGrams. Default 0."),
+      targetWeightGrams: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Target pack size in grams (or ml). Used only when packSizeWeight > 0."),
+      keywordWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Weight (0-1) for preferKeywords match component. Default 0.3."),
+      availabilityWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Weight (0-1) for availability. Default 0.3."),
+    },
+  },
+  async ({
+    query,
+    topN,
+    must,
+    avoid,
+    preferKeywords,
+    unitPriceWeight,
+    packSizeWeight,
+    targetWeightGrams,
+    keywordWeight,
+    availabilityWeight,
+  }) => {
+    return executeTool(
+      "search_products_scored",
+      {
+        query,
+        topN,
+        must,
+        avoid,
+        preferKeywords,
+        unitPriceWeight,
+        packSizeWeight,
+        targetWeightGrams,
+        keywordWeight,
+        availabilityWeight,
+      },
+      () =>
+        searchProductsScored(
+          query,
+          {
+            must,
+            avoid,
+            preferKeywords,
+            unitPriceWeight,
+            packSizeWeight,
+            targetWeightGrams,
+            keywordWeight,
+            availabilityWeight,
+          },
+          topN,
+        ),
     );
   },
 );
@@ -300,6 +413,86 @@ server.registerTool(
   async ({ productName, quantity }) => {
     return executeTool("update_item_quantity", { productName, quantity }, () =>
       updateItemQuantity(productName, quantity),
+    );
+  },
+);
+
+server.registerTool(
+  "get_delivery_slots",
+  {
+    description:
+      "Reads the Frisco 'choose delivery' page and returns the available delivery slot grid (per-day, per-hour) with prices, availability, and any banner notes. Optional filters: time-of-day (morning/afternoon/evening), maxPricePln, limit. Use after the cart has items but before placing the order; the user still confirms checkout in the browser.",
+    inputSchema: {
+      preferTimeOfDay: z
+        .enum(['morning', 'afternoon', 'evening'])
+        .optional()
+        .describe("Restrict to a coarse time bucket (morning=05–12, afternoon=12–18, evening=18–23)"),
+      maxPricePln: z
+        .number()
+        .min(0)
+        .optional()
+        .describe("Cap the slot delivery fee in PLN."),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("Maximum number of matching slots to return."),
+      onlyAvailable: z
+        .boolean()
+        .default(true)
+        .describe("If false, also include unavailable slots (greyed out on the page)."),
+    },
+  },
+  async ({ preferTimeOfDay, maxPricePln, limit, onlyAvailable }) => {
+    return executeTool(
+      "get_delivery_slots",
+      { preferTimeOfDay, maxPricePln, limit, onlyAvailable },
+      () => getDeliverySlots({ preferTimeOfDay, maxPricePln, limit, onlyAvailable }),
+    );
+  },
+);
+
+server.registerTool(
+  "get_order_history",
+  {
+    description:
+      "Reads the user's past Frisco orders from /stn,user-orders and returns a summary list (order ID, placed-at, status, total) plus a spend total. Optional filters: fromDate, toDate (ISO YYYY-MM-DD), status substring, minTotalPln, limit.",
+    inputSchema: {
+      fromDate: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional()
+        .describe("Inclusive lower-bound on placed-at date (YYYY-MM-DD)."),
+      toDate: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional()
+        .describe("Inclusive upper-bound on placed-at date (YYYY-MM-DD)."),
+      status: z
+        .string()
+        .optional()
+        .describe("Substring match on status label (case-insensitive)."),
+      minTotalPln: z
+        .number()
+        .min(0)
+        .optional()
+        .describe("Only orders with total >= this PLN amount."),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("Maximum number of orders to return."),
+    },
+  },
+  async ({ fromDate, toDate, status, minTotalPln, limit }) => {
+    return executeTool(
+      "get_order_history",
+      { fromDate, toDate, status, minTotalPln, limit },
+      () => getOrderHistory({ fromDate, toDate, status, minTotalPln, limit }),
     );
   },
 );

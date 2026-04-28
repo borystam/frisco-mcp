@@ -635,9 +635,30 @@ export async function clearCart(): Promise<string> {
   }
 }
 
+/**
+ * Per-item progress event emitted while add_items_to_cart works through
+ * its input list. Consumers (notably the MCP wrapper in src/index.ts)
+ * can hook this to emit a JSONL log line per item so the long-running
+ * tool gives feedback rather than going silent until done.
+ */
+export interface AddItemProgressEvent {
+  /** 1-based position in the input array. */
+  index: number;
+  /** Total items planned. */
+  total: number;
+  /** The item being processed. */
+  item: CartItem;
+  /** "ok" — added; "warn" — skipped/unavailable; "error" — exception. */
+  status: 'ok' | 'warn' | 'error';
+  /** Result line that will appear in the final reply. */
+  message: string;
+}
+
+export type AddItemProgressCallback = (event: AddItemProgressEvent) => void;
+
 export async function addItemsToCart(
   items: string,
-  options: { clearCartFirst?: boolean } = {},
+  options: { clearCartFirst?: boolean; onProgress?: AddItemProgressCallback } = {},
 ): Promise<string> {
   let products: CartItem[];
   try {
@@ -676,7 +697,30 @@ export async function addItemsToCart(
 
   const results: string[] = [];
 
-  for (const item of products) {
+  const emit = (
+    item: CartItem,
+    indexZero: number,
+    status: AddItemProgressEvent['status'],
+    message: string,
+  ) => {
+    results.push(message);
+    if (options.onProgress) {
+      try {
+        options.onProgress({
+          index: indexZero + 1,
+          total: products.length,
+          item,
+          status,
+          message,
+        });
+      } catch {
+        // progress is best-effort — never let it break the loop.
+      }
+    }
+  };
+
+  for (let i = 0; i < products.length; i++) {
+    const item = products[i];
     const displayName = item.name ?? "?";
     const quantityRaw = item.quantity ?? 1;
     const quantity =
@@ -694,12 +738,18 @@ export async function addItemsToCart(
         }
         const added = await addProductFromCurrentProductPage(page, quantity);
         if (!added.ok) {
-          results.push(
+          emit(
+            item,
+            i,
+            'warn',
             `⚠️ ${displayName}: ${added.reason ?? "could not add from product page"}`,
           );
           continue;
         }
-        results.push(
+        emit(
+          item,
+          i,
+          'ok',
           `✅ ${displayName} ×${quantity} (added from product page)`,
         );
         pageResults = null;
@@ -707,7 +757,10 @@ export async function addItemsToCart(
       }
 
       if (!searchContext) {
-        results.push(
+        emit(
+          item,
+          i,
+          'warn',
           `⚠️ ${displayName}: search context is required when productUrl is missing`,
         );
         continue;
@@ -723,7 +776,10 @@ export async function addItemsToCart(
       ) {
         const added = await addProductFromCurrentProductPage(page, quantity);
         if (!added.ok) {
-          results.push(
+          emit(
+            item,
+            i,
+            'warn',
             `⚠️ ${displayName}: ${added.reason ?? "could not add from current product page"}`,
           );
           continue;
@@ -734,7 +790,10 @@ export async function addItemsToCart(
         const pricePart = contextSelected.price
           ? ` — ${contextSelected.price}`
           : "";
-        results.push(
+        emit(
+          item,
+          i,
+          'ok',
           `✅ ${contextSelected.name}${weightPart} ×${quantity}${pricePart} (added from current product page)`,
         );
         pageResults = null;
@@ -745,7 +804,10 @@ export async function addItemsToCart(
         await ensureSearchResultsPage(page, searchContext.searchUrl);
         pageResults = await readVisibleSearchResultsFromPage(page);
         if (pageResults.length === 0) {
-          results.push(
+          emit(
+            item,
+            i,
+            'warn',
             `⚠️ ${displayName}: saved search page has no visible product results`,
           );
           continue;
@@ -758,7 +820,10 @@ export async function addItemsToCart(
         pageResults,
       );
       if (!selected) {
-        results.push(
+        emit(
+          item,
+          i,
+          'warn',
           `⚠️ ${displayName}: not found in the latest search results (query: "${searchContext.query}")`,
         );
         continue;
@@ -786,13 +851,16 @@ export async function addItemsToCart(
             message += `\n   - ${alternative.name}${weightPart}${pricePart}`;
           }
         }
-        results.push(message);
+        emit(item, i, 'warn', message);
         continue;
       }
 
       const addButton = await resolveAddButtonForResult(page, selected);
       if (!addButton) {
-        results.push(
+        emit(
+          item,
+          i,
+          'warn',
           `⚠️ ${displayName}: add button not available for "${selected.name}"`,
         );
         continue;
@@ -804,10 +872,15 @@ export async function addItemsToCart(
       }
       const weightPart = selected.weight ? ` [${selected.weight}]` : "";
       const pricePart = selected.price ? ` — ${selected.price}` : "";
-      results.push(`✅ ${selected.name}${weightPart} ×${quantity}${pricePart}`);
+      emit(
+        item,
+        i,
+        'ok',
+        `✅ ${selected.name}${weightPart} ×${quantity}${pricePart}`,
+      );
     } catch (error) {
-      const message = getErrorMessage(error).slice(0, 120);
-      results.push(`❌ ${displayName}: ${message}`);
+      const errMessage = getErrorMessage(error).slice(0, 120);
+      emit(item, i, 'error', `❌ ${displayName}: ${errMessage}`);
     }
   }
 

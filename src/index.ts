@@ -14,6 +14,7 @@ import {
 } from "./tools/cart.js";
 import {
   searchProducts,
+  searchProductsScored,
   getProductInfo,
   getProductReviews,
 } from "./tools/products.js";
@@ -207,6 +208,102 @@ server.registerTool(
   async ({ query, topN }) => {
     return executeTool("search_products", { query, topN }, () =>
       searchProducts(query, topN),
+    );
+  },
+);
+
+server.registerTool(
+  "search_products_scored",
+  {
+    description:
+      "Searches frisco.pl for products and ranks the top hits by user-supplied criteria. Each result has a 0-100 score with a per-criterion breakdown and a one-line reason. Use this when you want the best match for a query under explicit constraints (must/avoid keywords, lowest unit price, target pack size, prefer-keywords).",
+    inputSchema: {
+      query: z.string().describe("Product name to search for"),
+      topN: z.number().default(5).describe("Number of scored results to return (default 5)"),
+      must: z
+        .array(z.string())
+        .optional()
+        .describe("Required substrings in the product name (case-insensitive). Items missing any of these score 0."),
+      avoid: z
+        .array(z.string())
+        .optional()
+        .describe("Forbidden substrings in the product name (case-insensitive). Items containing any of these score 0."),
+      preferKeywords: z
+        .array(z.string())
+        .optional()
+        .describe("Bonus keywords; partial matches add weight to the keyword component."),
+      unitPriceWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Weight (0-1) for unit-price (PLN/kg or PLN/L) component. Default 0.4."),
+      packSizeWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Weight (0-1) for pack-size proximity to targetWeightGrams. Default 0."),
+      targetWeightGrams: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Target pack size in grams (or ml). Used only when packSizeWeight > 0."),
+      keywordWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Weight (0-1) for preferKeywords match component. Default 0.3."),
+      availabilityWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe("Weight (0-1) for availability. Default 0.3."),
+    },
+  },
+  async ({
+    query,
+    topN,
+    must,
+    avoid,
+    preferKeywords,
+    unitPriceWeight,
+    packSizeWeight,
+    targetWeightGrams,
+    keywordWeight,
+    availabilityWeight,
+  }) => {
+    return executeTool(
+      "search_products_scored",
+      {
+        query,
+        topN,
+        must,
+        avoid,
+        preferKeywords,
+        unitPriceWeight,
+        packSizeWeight,
+        targetWeightGrams,
+        keywordWeight,
+        availabilityWeight,
+      },
+      () =>
+        searchProductsScored(
+          query,
+          {
+            must,
+            avoid,
+            preferKeywords,
+            unitPriceWeight,
+            packSizeWeight,
+            targetWeightGrams,
+            keywordWeight,
+            availabilityWeight,
+          },
+          topN,
+        ),
     );
   },
 );

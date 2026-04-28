@@ -10,6 +10,7 @@ vi.mock('../browser.js', () => ({
   getLastSearchContext: () => null,
   productCache: new Map(),
   setLastSearchContext: vi.fn(),
+  closeBrowser: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../auth.js', () => ({
@@ -21,21 +22,42 @@ vi.mock('../auth.js', () => ({
   sessionExists: vi.fn().mockResolvedValue(false),
 }));
 
-const registered: string[] = [];
+interface Registration {
+  name: string;
+  description?: string;
+}
+
+const registered: Registration[] = [];
 
 vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => {
   return {
     McpServer: class {
-      registerTool(name: string, _opts: unknown, _handler: unknown) {
-        registered.push(name);
+      registerTool(name: string, opts: { description?: string }, _handler: unknown) {
+        registered.push({ name, description: opts?.description });
       }
-      connect() { return Promise.resolve(); }
+      connect() {
+        return Promise.resolve();
+      }
+      close() {
+        return Promise.resolve();
+      }
     },
   };
 });
 
 vi.mock('@modelcontextprotocol/sdk/server/stdio.js', () => ({
   StdioServerTransport: class {},
+}));
+
+vi.mock('../http-server.js', () => ({
+  runHttp: vi.fn().mockResolvedValue({
+    httpServer: { close: (cb: () => void) => cb() },
+    transport: {},
+    address: { host: '127.0.0.1', port: 0 },
+    close: vi.fn().mockResolvedValue(undefined),
+  }),
+  readEnvOptions: vi.fn(),
+  isLoopbackHost: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock('../logger.js', () => ({
@@ -47,28 +69,66 @@ vi.mock('../logger.js', () => ({
   tailLogs: vi.fn(),
 }));
 
+// Item 8: lock the public tool surface to this exact set. Reordering or
+// renaming a tool is a breaking change for any consumer; require an
+// explicit, reviewable diff to this test rather than letting it slip in.
+const EXPECTED_TOOLS = [
+  'get_logs',
+  'tail_logs',
+  'login',
+  'finish_session',
+  'clear_session',
+  'view_cart',
+  'clear_cart',
+  'add_items_to_cart',
+  'search_products',
+  'search_products_scored',
+  'get_product_info',
+  'remove_item_from_cart',
+  'check_cart_issues',
+  'get_product_reviews',
+  'view_promotions',
+  'update_item_quantity',
+  'get_delivery_slots',
+  'get_order_history',
+] as const;
+
 describe('tool registry', () => {
   it('registers the expected tool names without throwing', async () => {
     registered.length = 0;
     await import('../index.js');
-    // Registration happens at module-eval time.
-    expect(registered).toContain('search_products');
-    expect(registered).toContain('search_products_scored');
-    expect(registered).toContain('get_product_info');
-    expect(registered).toContain('get_product_reviews');
-    expect(registered).toContain('add_items_to_cart');
-    expect(registered).toContain('view_cart');
-    expect(registered).toContain('clear_cart');
-    expect(registered).toContain('remove_item_from_cart');
-    expect(registered).toContain('check_cart_issues');
-    expect(registered).toContain('view_promotions');
-    expect(registered).toContain('update_item_quantity');
-    expect(registered).toContain('get_delivery_slots');
-    expect(registered).toContain('get_order_history');
+    const names = registered.map((r) => r.name);
+    expect(names).toContain('search_products');
+    expect(names).toContain('search_products_scored');
+    expect(names).toContain('get_product_info');
+    expect(names).toContain('get_product_reviews');
+    expect(names).toContain('add_items_to_cart');
+    expect(names).toContain('view_cart');
+    expect(names).toContain('clear_cart');
+    expect(names).toContain('remove_item_from_cart');
+    expect(names).toContain('check_cart_issues');
+    expect(names).toContain('view_promotions');
+    expect(names).toContain('update_item_quantity');
+    expect(names).toContain('get_delivery_slots');
+    expect(names).toContain('get_order_history');
   });
 
   it('registers no duplicate tool names', async () => {
-    const seen = new Set(registered);
-    expect(seen.size).toBe(registered.length);
+    const names = registered.map((r) => r.name);
+    const seen = new Set(names);
+    expect(seen.size).toBe(names.length);
+  });
+
+  it('exposes the locked tool surface — no extras, no missing', () => {
+    const names = registered.map((r) => r.name);
+    expect(new Set(names)).toEqual(new Set(EXPECTED_TOOLS));
+    expect(names.length).toBe(EXPECTED_TOOLS.length);
+  });
+
+  it('every tool has a non-empty description', () => {
+    for (const r of registered) {
+      expect(r.description, `tool ${r.name} missing description`).toBeTruthy();
+      expect(r.description!.length).toBeGreaterThan(10);
+    }
   });
 });

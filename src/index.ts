@@ -2,6 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { runHttp, readEnvOptions, type RunningHttpServer } from "./http-server.js";
+import { closeBrowser } from "./browser.js";
+
 import { login, finishSession, clearSession } from "./tools/session.js";
 import {
   addItemsToCart,
@@ -497,15 +500,81 @@ server.registerTool(
   },
 );
 
-async function run() {
+// Exported so tests and embedders can construct the server without binding
+// a transport. Re-running registers the same tools on a fresh instance.
+export function getServer(): McpServer {
+  return server;
+}
+
+const SHUTDOWN_BUDGET_MS = 10_000;
+
+interface RunningServer {
+  close: () => Promise<void>;
+}
+
+async function run(): Promise<void> {
   await initLogger();
+  const transportName = (process.env.MCP_TRANSPORT ?? "stdio").trim().toLowerCase();
   await logEvent("server_starting", {
     sessionId: getCurrentSessionId(),
     sessionLogPath: getCurrentSessionLogPath(),
+    transport: transportName,
   });
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+
+  let running: RunningServer;
+  if (transportName === "http") {
+    const opts = readEnvOptions();
+    const r: RunningHttpServer = await runHttp(server, opts);
+    running = { close: () => r.close() };
+  } else if (transportName === "stdio" || transportName === "") {
+    const stdio = new StdioServerTransport();
+    await server.connect(stdio);
+    running = { close: async () => server.close() };
+  } else {
+    throw new Error(
+      `MCP_TRANSPORT must be 'stdio' or 'http', got ${JSON.stringify(transportName)}`,
+    );
+  }
+
+  installSignalHandlers(running);
   await logEvent("server_started");
+}
+
+function installSignalHandlers(running: RunningServer): void {
+  let shuttingDown = false;
+  const handle = (signal: NodeJS.Signals): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void shutdown(signal, running);
+  };
+  process.once("SIGTERM", handle);
+  process.once("SIGINT", handle);
+}
+
+async function shutdown(signal: string, running: RunningServer): Promise<void> {
+  const deadline = Date.now() + SHUTDOWN_BUDGET_MS;
+  const hardExit = setTimeout(() => {
+    process.stderr.write(`[frisco-mcp] shutdown deadline exceeded on ${signal}, forcing exit\n`);
+    process.exit(1);
+  }, SHUTDOWN_BUDGET_MS);
+  hardExit.unref();
+  try {
+    await logEvent("server_stopping", { signal });
+    await running.close();
+    const browserBudget = Math.max(1_000, deadline - Date.now());
+    await Promise.race([
+      closeBrowser(),
+      new Promise<void>((resolve) => setTimeout(resolve, browserBudget).unref()),
+    ]);
+    await logEvent("server_stopped", { signal });
+  } catch (err) {
+    process.stderr.write(
+      `[frisco-mcp] shutdown error: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  } finally {
+    clearTimeout(hardExit);
+    process.exit(0);
+  }
 }
 
 run().catch((error) => {
@@ -516,6 +585,6 @@ run().catch((error) => {
     },
     "error",
   );
-  console.error("Fatal error starting server:", error);
+  process.stderr.write(`[frisco-mcp] fatal: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);
 });

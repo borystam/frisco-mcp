@@ -119,7 +119,9 @@ describe("readEnvOptions", () => {
     expect(isLoopbackHost("localhost")).toBe(true);
     expect(isLoopbackHost("LocalHost")).toBe(true);
     expect(isLoopbackHost("0.0.0.0")).toBe(false);
-    expect(isLoopbackHost("10.0.0.1")).toBe(false);
+    // 203.0.0.113 is TEST-NET-3 (RFC 5737) — documentation-only range,
+    // safe to reference in a public test.
+    expect(isLoopbackHost("203.0.113.1")).toBe(false);
   });
 
   it("refuses non-loopback bind without bearer", () => {

@@ -108,7 +108,7 @@ The risk surface here is product-shopping context leakage (queries, prices, name
 
 `src/browser.ts::closeBrowser` wraps `_browser.close()` in `try/catch` that swallows errors, then nulls the handles. If the MCP server is killed with SIGKILL, the Chromium process can survive as a zombie. The `_browser?.isConnected()` check on next `getPage()` correctly detects this and triggers a fresh launch.
 
-Acceptable for personal-use; documented for Phase 2 toolbox deployment so the systemd unit can include `KillMode=mixed` and `KillSignal=SIGTERM` to give the browser teardown a chance.
+Acceptable for personal-use; documented for Phase 2 hosted deployment so the supervisor (`tini` as PID 1 inside the container; `KillMode=mixed` for systemd) gives the browser teardown a chance.
 
 ## 10. Open issues triage (upstream)
 

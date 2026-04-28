@@ -1,0 +1,107 @@
+name: Container smoke
+
+on:
+  push:
+    branches: [master, 'claude/**']
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-smoke:
+    name: Build image + healthz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: frisco-mcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate docker-compose.example.yml
+        run: docker compose -f docker-compose.example.yml config --quiet
+
+      - name: Image-size budget (≤ 2 GB)
+        run: |
+          set -euo pipefail
+          BYTES=$(docker image inspect frisco-mcp:ci --format='{{.Size}}')
+          MB=$(( BYTES / 1024 / 1024 ))
+          echo "image size: ${MB} MB"
+          test "${MB}" -le 2048
+
+      - name: Run container in background
+        run: |
+          docker run -d --name frisco-ci \
+            -p 127.0.0.1:3031:3031 \
+            -e MCP_TRANSPORT=http \
+            -e MCP_HTTP_HOST=127.0.0.1 \
+            -e MCP_HTTP_PORT=3031 \
+            -e MCP_HTTP_BEARER=ci-test-token \
+            frisco-mcp:ci
+
+      - name: Wait for health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3031/healthz >/dev/null 2>&1; then
+              echo "healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "container did not become healthy within 60s"
+          docker logs frisco-ci || true
+          exit 1
+
+      - name: Auth — wrong bearer must 401
+        run: |
+          set -euo pipefail
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:3031/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer wrong' \
+            --data '{}')
+          test "${STATUS}" = "401"
+
+      - name: Auth — no bearer must 401
+        run: |
+          set -euo pipefail
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:3031/mcp \
+            -H 'Content-Type: application/json' \
+            --data '{}')
+          test "${STATUS}" = "401"
+
+      - name: Stop and assert clean exit
+        run: |
+          set -euo pipefail
+          # docker stop sends SIGTERM; default grace is 10s. Our
+          # entrypoint should exit 0 well within that.
+          START=$SECONDS
+          docker stop --time 15 frisco-ci
+          ELAPSED=$(( SECONDS - START ))
+          echo "stop took ${ELAPSED}s"
+          test "${ELAPSED}" -le 14
+
+          STATE=$(docker inspect frisco-ci --format '{{.State.Status}}|{{.State.ExitCode}}')
+          echo "final state: ${STATE}"
+          # We accept either exit 0 (clean shutdown) or 143 (SIGTERM)
+          # since both indicate the container responded to the signal
+          # without escalating to SIGKILL — which is what `docker stop
+          # --time 15` would do at the deadline.
+          case "${STATE}" in
+            exited\|0|exited\|143) ;;
+            *) echo "unexpected final state"; exit 1 ;;
+          esac
+
+      - name: Container logs (for debugging)
+        if: failure()
+        run: docker logs frisco-ci || true

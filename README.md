@@ -148,6 +148,112 @@ Add to your Cursor MCP settings (`~/.cursor/mcp.json` or workspace `.cursor/mcp.
 
 ---
 
+## Running as a hosted MCP
+
+When you want the server to live on a different host from the AI
+agent, or in a container, point it at a network transport instead of
+stdio.
+
+### Transports
+
+`MCP_TRANSPORT` selects the transport:
+
+| Value | Behaviour |
+| --- | --- |
+| `stdio` (default) | Subprocess transport. The agent spawns the MCP and pipes JSON-RPC over stdin/stdout. |
+| `http` | Streamable HTTP transport (stateless, JSON-response). The MCP listens on a port and the agent connects with bearer auth. |
+
+### HTTP-mode environment variables
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `MCP_HTTP_HOST` | `127.0.0.1` | Bind address. |
+| `MCP_HTTP_PORT` | `3031` | Bind port. `0` = ephemeral. |
+| `MCP_HTTP_BEARER` | _unset_ | Bearer required if `MCP_HTTP_HOST` is non-loopback; the server refuses to start otherwise. Compared with `crypto.timingSafeEqual`. |
+| `MCP_HTTP_BODY_LIMIT_BYTES` | `1048576` | Per-request body cap; oversized requests get `413`. |
+| `MCP_HTTP_IDLE_TIMEOUT_MS` | `30000` | Slow-client cap (request and keep-alive timeouts). |
+| `MCP_HTTP_PATH` | `/mcp` | MCP endpoint path. |
+| `MCP_HTTP_HEALTHZ_PATH` | `/healthz` | Liveness probe path. Always `200 ok\n`, no auth. |
+
+The startup banner is a single line on stderr — name, version,
+transport, bind address, and `auth=on/off`. It never includes the
+bearer value.
+
+### Optional credential autofill
+
+If both `FRISCO_USER` and `FRISCO_PASS` are set, the `login` tool
+attempts to fill the email + password fields on the Frisco login page
+before its cookie-poll loop. On any selector miss it silently falls
+back to the manual flow. **The server never writes either value to a
+log, never returns it in a tool response, and never accepts it as a
+tool input.**
+
+### Container build
+
+```bash
+docker build -t frisco-mcp:latest .
+docker run --rm \
+  -p 127.0.0.1:3031:3031 \
+  -p 127.0.0.1:6080:6080 \
+  -v frisco-session:/home/pwuser/.frisco-mcp \
+  -e MCP_TRANSPORT=http \
+  -e MCP_HTTP_BEARER=changeme \
+  frisco-mcp:latest
+```
+
+The image bundles Xvfb, x11vnc, and noVNC so the headed Chromium can
+run on a server. For the one-time interactive login, point a browser
+at `http://127.0.0.1:6080/vnc.html` to drive the visible window. After
+the cookie is seated, the server is fully autonomous until the cookie
+expires.
+
+`docker-compose.example.yml` ships as documentation-only placeholders.
+Copy it to your private deployment repo and fill in real values
+there — never commit a real bearer to this fork (it is public).
+
+### MCP client config (HTTP)
+
+```json
+{
+  "mcpServers": {
+    "frisco": {
+      "url": "http://127.0.0.1:3031/mcp",
+      "headers": { "Authorization": "Bearer changeme" }
+    }
+  }
+}
+```
+
+### Healthcheck
+
+```bash
+curl -fsS http://127.0.0.1:3031/healthz   # → ok
+```
+
+`/healthz` is always public (no bearer required). It is a liveness
+probe — it does not check Frisco reachability or session validity. To
+distinguish "session current" from "server up", call `view_cart`,
+which surfaces a clean error on expired session.
+
+### Signal handling
+
+`SIGTERM` and `SIGINT` trigger a graceful shutdown: the transport
+closes, then Chromium tears down, with a 10 s budget before a hard
+exit. Container supervisors (`tini` as PID 1; `KillMode=mixed` for
+systemd) propagate signals correctly out of the box.
+
+### Audit constraints (don't violate)
+
+- File modes: `~/.frisco-mcp/` = `0700`, `session.json` and
+  `*.jsonl` logs = `0600`. Locked by regression tests.
+- Headed Chromium only. On a headless host use Xvfb (the bundled
+  Dockerfile already does); never set `headless: true`.
+- No stealth / anti-bot dependencies. Frisco runs Cloudflare;
+  introducing fingerprint evasion violates the site's Terms.
+- No telemetry. Outbound at runtime: only `frisco.pl`.
+
+---
+
 ## Usage
 
 ### 1. Log in

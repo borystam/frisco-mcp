@@ -187,7 +187,21 @@ server.registerTool(
   },
   async ({ items, clearCartFirst }) => {
     return executeTool("add_items_to_cart", { items, clearCartFirst }, () =>
-      addItemsToCart(items, { clearCartFirst }),
+      addItemsToCart(items, {
+        clearCartFirst,
+        // Per-item progress: emits one log line as each cart item resolves,
+        // so a long batch (15+ items) shows movement instead of going silent.
+        onProgress: (event) => {
+          void logEvent("cart_item_progress", {
+            index: event.index,
+            total: event.total,
+            status: event.status,
+            name: event.item.name ?? null,
+            quantity: event.item.quantity ?? 1,
+            messagePreview: event.message.slice(0, 200),
+          });
+        },
+      }),
     );
   },
 );

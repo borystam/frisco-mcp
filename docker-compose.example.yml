@@ -1,0 +1,80 @@
+# Frisco MCP — example compose file.
+#
+# This file is committed as documentation only. ALL VALUES ARE
+# PLACEHOLDERS. Copy it to docker-compose.yml in your private
+# deployment repo (or to a local override that is gitignored), then
+# customise host bindings, ports, and secrets there. Never commit a
+# real bearer or password to a public repo.
+#
+# Defaults below are deliberately conservative:
+#   - Loopback-only port bindings on the host (127.0.0.1).
+#   - Bearer auth REQUIRED if you change the host binding to anything
+#     other than 127.0.0.1 (the server refuses to start otherwise).
+#   - Session cookie volume so credentials survive restarts.
+
+services:
+  frisco-mcp:
+    image: frisco-mcp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: frisco-mcp
+
+    restart: unless-stopped
+
+    # Inside the container, the MCP server listens on 127.0.0.1:3031
+    # and noVNC on 0.0.0.0:6080. Publish to the host on loopback only
+    # by default; a deployment that wants LAN access binds explicitly
+    # in its own override file.
+    ports:
+      - "127.0.0.1:3031:3031"
+      - "127.0.0.1:6080:6080"
+
+    environment:
+      # Transport selection: http or stdio.
+      MCP_TRANSPORT: http
+      MCP_HTTP_HOST: 127.0.0.1
+      MCP_HTTP_PORT: 3031
+
+      # REQUIRED if MCP_HTTP_HOST is non-loopback. Replace `changeme`
+      # with a random value generated locally; never commit it.
+      MCP_HTTP_BEARER: changeme
+
+      # Optional: limits and timeouts.
+      # MCP_HTTP_BODY_LIMIT_BYTES: 1048576
+      # MCP_HTTP_IDLE_TIMEOUT_MS: 30000
+
+      # Optional: noVNC password. If unset, x11vnc runs unauthenticated
+      # but listens only on loopback inside the container; noVNC is the
+      # only path in.
+      # X11VNC_PASSWORD: changeme
+
+      # Optional: Frisco credentials for autofill. The server never
+      # logs these. If unset, the `login` tool falls back to a manual
+      # browser flow via noVNC.
+      # FRISCO_USER: you@example.invalid
+      # FRISCO_PASS: changeme
+
+    # Cookie persistence — survives container restarts.
+    volumes:
+      - frisco-session:/home/pwuser/.frisco-mcp
+
+    # Healthcheck duplicates the Dockerfile's, with the same probe.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - require('http').get('http://127.0.0.1:'+ (process.env.MCP_HTTP_PORT||3031) +'/healthz', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    # Tini already handles signals; keep this short so failed exits are
+    # surfaced fast rather than waiting on the default grace period.
+    stop_grace_period: 15s
+
+volumes:
+  frisco-session:
+    # Cookie file is 0600 inside the volume; do not loosen.

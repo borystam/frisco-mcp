@@ -1,0 +1,45 @@
+# Build artefacts, caches, runtime state — none of these belong in the image.
+node_modules
+dist
+coverage
+
+# Personal / runtime state from any local dev run.
+.frisco-mcp
+**/.frisco-mcp
+
+# Debugging artefacts that may include real product / cart screenshots.
+screenshots
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.har
+
+# Local-only test fixtures.
+test_data/personal
+
+# Editor + OS noise.
+.git
+.github
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Secrets — must never be in an image.
+.env
+.env.*
+!.env.example
+secrets
+*.pem
+*.key
+
+# Logs.
+*.log
+logs
+
+# Local docker overrides (compose.override.yml etc) that might contain
+# deployment-specific values.
+docker-compose.override.yml
+docker-compose.override.yaml

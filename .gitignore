@@ -1,4 +1,34 @@
 node_modules/
 dist/
+coverage/
 *.log
+
+# Secrets — committed example only.
 .env
+.env.*
+!.env.example
+
+# Local runtime state from any dev session.
+.frisco-mcp/
+**/.frisco-mcp/
+
+# Anything captured during a debugging run that may contain real cart
+# data, addresses, or personal info. The fork is public — keep these
+# under a screenshots/ tree, where this rule blocks them by default.
+screenshots/
+playwright-report/
+test-results/
+*.har
+
+# Personal test fixtures — keep them off the public repo.
+test_data/personal/
+
+# Local docker overrides.
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# OS / editor noise.
+.DS_Store
+.vscode/
+.idea/
+*.swp

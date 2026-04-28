@@ -74,6 +74,34 @@ describe('auth', () => {
     expect(saved).toEqual(mockCookies);
   });
 
+  it('saveSession writes session.json with mode 0600', async () => {
+    const { saveSession } = await importAuth();
+    const mockContext = {
+      cookies: vi.fn().mockResolvedValue([]),
+    } as any;
+
+    await saveSession(mockContext);
+
+    const stat = await fs.stat(SESSION_FILE);
+    // Strip type bits, keep permission bits.
+    expect(stat.mode & 0o777).toBe(0o600);
+  });
+
+  it('saveSession tightens permissions on a pre-existing world-readable session file', async () => {
+    await fs.writeFile(SESSION_FILE, '[]', { encoding: 'utf-8', mode: 0o644 });
+    await fs.chmod(SESSION_FILE, 0o644);
+
+    const { saveSession } = await importAuth();
+    const mockContext = {
+      cookies: vi.fn().mockResolvedValue([{ name: 'sid', value: 'x', domain: 'frisco.pl', path: '/' }]),
+    } as any;
+
+    await saveSession(mockContext);
+
+    const stat = await fs.stat(SESSION_FILE);
+    expect(stat.mode & 0o777).toBe(0o600);
+  });
+
   it('restoreSession loads cookies into context', async () => {
     const cookies = [
       { name: 'sid', value: 'xyz', domain: 'frisco.pl', path: '/' },

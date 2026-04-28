@@ -6,10 +6,26 @@ import type { Page, BrowserContext } from 'playwright';
 const DATA_DIR = join(homedir(), '.frisco-mcp');
 export const SESSION_PATH = join(DATA_DIR, 'session.json');
 
+// Owner-only file mode for the session cookie file (rw-------).
+// Prevents other local users from reading session cookies.
+const SESSION_FILE_MODE = 0o600;
+const SESSION_DIR_MODE = 0o700;
+
 export async function saveSession(context: BrowserContext): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.mkdir(DATA_DIR, { recursive: true, mode: SESSION_DIR_MODE });
+  // Best-effort: tighten dir mode if it pre-existed with looser permissions.
+  try {
+    await fs.chmod(DATA_DIR, SESSION_DIR_MODE);
+  } catch {}
   const cookies = await context.cookies();
-  await fs.writeFile(SESSION_PATH, JSON.stringify(cookies, null, 2), 'utf-8');
+  await fs.writeFile(SESSION_PATH, JSON.stringify(cookies, null, 2), {
+    encoding: 'utf-8',
+    mode: SESSION_FILE_MODE,
+  });
+  // writeFile only sets mode on file creation; chmod after to be safe.
+  try {
+    await fs.chmod(SESSION_PATH, SESSION_FILE_MODE);
+  } catch {}
 }
 
 export async function restoreSession(context: BrowserContext): Promise<boolean> {

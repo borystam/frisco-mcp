@@ -19,6 +19,7 @@ import {
   getProductReviews,
 } from "./tools/products.js";
 import { getDeliverySlots } from "./tools/delivery.js";
+import { getOrderHistory } from "./tools/orders.js";
 import {
   initLogger,
   logEvent,
@@ -449,6 +450,49 @@ server.registerTool(
       "get_delivery_slots",
       { preferTimeOfDay, maxPricePln, limit, onlyAvailable },
       () => getDeliverySlots({ preferTimeOfDay, maxPricePln, limit, onlyAvailable }),
+    );
+  },
+);
+
+server.registerTool(
+  "get_order_history",
+  {
+    description:
+      "Reads the user's past Frisco orders from /stn,user-orders and returns a summary list (order ID, placed-at, status, total) plus a spend total. Optional filters: fromDate, toDate (ISO YYYY-MM-DD), status substring, minTotalPln, limit.",
+    inputSchema: {
+      fromDate: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional()
+        .describe("Inclusive lower-bound on placed-at date (YYYY-MM-DD)."),
+      toDate: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional()
+        .describe("Inclusive upper-bound on placed-at date (YYYY-MM-DD)."),
+      status: z
+        .string()
+        .optional()
+        .describe("Substring match on status label (case-insensitive)."),
+      minTotalPln: z
+        .number()
+        .min(0)
+        .optional()
+        .describe("Only orders with total >= this PLN amount."),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("Maximum number of orders to return."),
+    },
+  },
+  async ({ fromDate, toDate, status, minTotalPln, limit }) => {
+    return executeTool(
+      "get_order_history",
+      { fromDate, toDate, status, minTotalPln, limit },
+      () => getOrderHistory({ fromDate, toDate, status, minTotalPln, limit }),
     );
   },
 );

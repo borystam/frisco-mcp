@@ -18,6 +18,7 @@ import {
   getProductInfo,
   getProductReviews,
 } from "./tools/products.js";
+import { getDeliverySlots } from "./tools/delivery.js";
 import {
   initLogger,
   logEvent,
@@ -411,6 +412,43 @@ server.registerTool(
   async ({ productName, quantity }) => {
     return executeTool("update_item_quantity", { productName, quantity }, () =>
       updateItemQuantity(productName, quantity),
+    );
+  },
+);
+
+server.registerTool(
+  "get_delivery_slots",
+  {
+    description:
+      "Reads the Frisco 'choose delivery' page and returns the available delivery slot grid (per-day, per-hour) with prices, availability, and any banner notes. Optional filters: time-of-day (morning/afternoon/evening), maxPricePln, limit. Use after the cart has items but before placing the order; the user still confirms checkout in the browser.",
+    inputSchema: {
+      preferTimeOfDay: z
+        .enum(['morning', 'afternoon', 'evening'])
+        .optional()
+        .describe("Restrict to a coarse time bucket (morning=05–12, afternoon=12–18, evening=18–23)"),
+      maxPricePln: z
+        .number()
+        .min(0)
+        .optional()
+        .describe("Cap the slot delivery fee in PLN."),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("Maximum number of matching slots to return."),
+      onlyAvailable: z
+        .boolean()
+        .default(true)
+        .describe("If false, also include unavailable slots (greyed out on the page)."),
+    },
+  },
+  async ({ preferTimeOfDay, maxPricePln, limit, onlyAvailable }) => {
+    return executeTool(
+      "get_delivery_slots",
+      { preferTimeOfDay, maxPricePln, limit, onlyAvailable },
+      () => getDeliverySlots({ preferTimeOfDay, maxPricePln, limit, onlyAvailable }),
     );
   },
 );

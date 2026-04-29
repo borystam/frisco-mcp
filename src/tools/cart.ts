@@ -666,23 +666,78 @@ export interface AddItemProgressEvent {
 
 export type AddItemProgressCallback = (event: AddItemProgressEvent) => void;
 
+// Quantity-key aliases that small models (qwen3.6-class) commonly emit
+// instead of the documented "quantity". Normalising here saves one
+// retry round-trip per agent call — measured concretely against the
+// live qwen3.6:27b backing Hermes.
+const QUANTITY_ALIASES = ["qty", "amount", "count", "n"] as const;
+
+function normaliseCartItem(raw: unknown): { item: CartItem | null; warnings: string[] } {
+  const warnings: string[] = [];
+  if (raw === null || typeof raw !== "object") {
+    return { item: null, warnings: ["item must be an object"] };
+  }
+  const r = raw as Record<string, unknown>;
+  const item: CartItem = {
+    name: typeof r.name === "string" ? r.name : "",
+  };
+  // Quantity aliases — accept the most common LLM-emitted variants.
+  if (r.quantity === undefined) {
+    for (const alias of QUANTITY_ALIASES) {
+      if (r[alias] !== undefined) {
+        item.quantity = r[alias] as number;
+        warnings.push(`'${alias}' field aliased to 'quantity' — please pass 'quantity' next time`);
+        break;
+      }
+    }
+  } else {
+    item.quantity = r.quantity as number;
+  }
+  if (typeof r.productUrl === "string") item.productUrl = r.productUrl;
+  if (typeof r.searchQuery === "string") item.searchQuery = r.searchQuery;
+  return { item, warnings };
+}
+
 export async function addItemsToCart(
-  items: string,
+  items: string | unknown[],
   options: { clearCartFirst?: boolean; onProgress?: AddItemProgressCallback } = {},
 ): Promise<string> {
+  // Accept both stringified JSON (the documented contract) and a raw
+  // array — strict structured-output models will sometimes pass the
+  // array directly, ignoring the schema's `string` declaration.
   let products: CartItem[];
-  try {
-    products = JSON.parse(items) as CartItem[];
-  } catch {
-    return '❌ Invalid JSON. Expected: \'[{"name":"...","searchQuery":"...","quantity":1}]\'';
+  let raw: unknown;
+  if (Array.isArray(items)) {
+    raw = items;
+  } else if (typeof items === "string") {
+    try {
+      raw = JSON.parse(items);
+    } catch {
+      return '❌ Invalid JSON. Expected: \'[{"name":"...","searchQuery":"...","quantity":1}]\'';
+    }
+  } else {
+    return '❌ Invalid input. Expected a JSON array (or its stringified form).';
   }
-
-  if (!Array.isArray(products)) {
+  if (!Array.isArray(raw)) {
     return "❌ Invalid input. Expected a JSON array of products.";
   }
-
-  if (products.length === 0) {
+  if (raw.length === 0) {
     return "❌ Empty items array — pass at least one product.";
+  }
+  // Normalise each entry and collect alias warnings — they're appended
+  // once at the top of the response so the LLM learns the schema for
+  // the next call but the call still succeeds.
+  const aliasWarnings: string[] = [];
+  products = [];
+  for (let i = 0; i < raw.length; i++) {
+    const { item, warnings } = normaliseCartItem(raw[i]);
+    if (item) {
+      products.push(item);
+      for (const w of warnings) aliasWarnings.push(`item[${i}] ${w}`);
+    } else {
+      // Reject items that aren't even objects up front.
+      return `❌ Invalid input: item[${i}] ${warnings.join(", ")}`;
+    }
   }
 
   // Quantity validation. Default missing → 1; reject 0, negatives, non-
@@ -980,9 +1035,18 @@ export async function addItemsToCart(
   }
 
   const addedCount = results.filter((line) => line.startsWith("✅")).length;
+  const aliasBanner =
+    aliasWarnings.length > 0
+      ? [
+          "ℹ️ Schema notes:",
+          ...aliasWarnings.map((w) => `   • ${w}`),
+          "",
+        ]
+      : [];
   return [
     `🛒 Added ${addedCount}/${products.length} items:`,
     "",
+    ...aliasBanner,
     results.join("\n"),
     "",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",

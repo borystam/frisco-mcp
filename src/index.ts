@@ -197,10 +197,23 @@ server.registerTool(
     description:
       "Adds products to cart by selecting from the most recent search_products result page. No additional search is performed.",
     inputSchema: {
+      // Accept both the documented stringified-JSON form (small models
+      // tend to honour the `string` declaration) and the raw array
+      // form (strict structured-output models often pass through).
       items: z
-        .string()
+        .union([
+          z.string(),
+          z.array(
+            z.object({
+              name: z.string(),
+              quantity: z.number().optional(),
+              productUrl: z.string().optional(),
+              searchQuery: z.string().optional(),
+            }).passthrough(),
+          ),
+        ])
         .describe(
-          'JSON array of items, e.g. [{"name":"PIĄTNICA Skyr naturalny","quantity":2}] or [{"name":"...","productUrl":"https://www.frisco.pl/pid,...","quantity":1}]',
+          'Array of items (or its stringified JSON form), e.g. [{"name":"PIĄTNICA Skyr","quantity":2}] or [{"name":"...","productUrl":"https://www.frisco.pl/pid,...","quantity":1}]',
         ),
       clearCartFirst: z
         .boolean()

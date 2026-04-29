@@ -116,6 +116,69 @@ describe('addItemsToCart — input validation', () => {
   });
 });
 
+describe('addItemsToCart — small-model schema tolerance', () => {
+  it('accepts a raw array (not stringified JSON)', async () => {
+    // Strict structured-output models pass through the array as-is.
+    // The function must accept either form.
+    const cache = new Map([
+      ['X', { name: 'X', url: 'https://www.frisco.pl/pid,1/', price: '', weight: null, macros: {}, ingredients: null }],
+    ]);
+    vi.doMock('../browser.js', () => ({
+      getPage: vi.fn(() => { throw new Error('past-the-gate sentinel'); }),
+      getContext: vi.fn(),
+      productCache: cache,
+      getLastSearchContext: () => null,
+      setLastSearchContext: vi.fn(),
+      closeBrowser: vi.fn(),
+      withPageLock: <T,>(fn: () => Promise<T>): Promise<T> => fn(),
+    }));
+    vi.resetModules();
+    const { addItemsToCart } = await import('../tools/cart.js');
+    await expect(
+      addItemsToCart([{ name: 'X', quantity: 1 }] as unknown[]),
+    ).rejects.toThrow(/past-the-gate sentinel/);
+    vi.doUnmock('../browser.js');
+    vi.resetModules();
+  });
+
+  it.each([
+    ['qty', '[{"name":"X","qty":2}]'],
+    ['amount', '[{"name":"X","amount":3}]'],
+    ['count', '[{"name":"X","count":4}]'],
+    ['n', '[{"name":"X","n":5}]'],
+  ])('aliases %s → quantity (instead of silently using default 1)', async (alias, payload) => {
+    // Use a captured CartItem to assert the alias actually mapped.
+    const cache = new Map<string, { url: string; price: string; weight: null; macros: object; ingredients: null; name: string }>();
+    let captured: { name?: string; quantity?: number } | null = null;
+    vi.doMock('../browser.js', () => ({
+      getPage: vi.fn(() => { throw new Error('past-the-gate sentinel'); }),
+      getContext: vi.fn(),
+      productCache: cache,
+      getLastSearchContext: () => ({
+        query: 'X',
+        searchUrl: 'https://www.frisco.pl/q,X/',
+        results: [{ name: 'X', url: 'https://www.frisco.pl/pid,1/', price: '', weight: '', available: true }],
+        updatedAt: Date.now(),
+      }),
+      setLastSearchContext: vi.fn(),
+      closeBrowser: vi.fn(),
+      withPageLock: <T,>(fn: () => Promise<T>): Promise<T> => fn(),
+    }));
+    vi.resetModules();
+    const { addItemsToCart } = await import('../tools/cart.js');
+    const r = await addItemsToCart(payload).catch((e: Error) => e.message);
+    // Got past the gate (mock threw the sentinel) → alias was
+    // normalised. If we'd failed normalisation we'd see the
+    // quantity-validation message instead.
+    expect(r).not.toMatch(/quantity must be a positive integer/);
+    expect(r).toMatch(/past-the-gate sentinel/);
+    void alias;
+    void captured;
+    vi.doUnmock('../browser.js');
+    vi.resetModules();
+  });
+});
+
 describe('addItemsToCart — productCache fallback for multi-search workflows', () => {
   it('does not require a fresh searchContext when every item is in productCache (exact match)', async () => {
     const cache = new Map([

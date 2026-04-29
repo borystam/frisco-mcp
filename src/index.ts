@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { runHttp, readEnvOptions, type RunningHttpServer } from "./http-server.js";
-import { closeBrowser } from "./browser.js";
+import { closeBrowser, withPageLock } from "./browser.js";
 
 import { login, finishSession, clearSession } from "./tools/session.js";
 import {
@@ -53,6 +53,10 @@ type ToolResult = {
   isError?: boolean;
 };
 
+// Tools that don't touch the browser — safe to run outside the lock so
+// log readers don't block on a long-running login or cart op.
+const NON_BROWSER_TOOLS = new Set(["get_logs", "tail_logs"]);
+
 async function executeTool(
   toolName: string,
   input: Record<string, unknown>,
@@ -61,7 +65,10 @@ async function executeTool(
   const startedAt = Date.now();
   await logEvent("tool_started", { toolName, input });
   try {
-    const text = await run();
+    const guarded = NON_BROWSER_TOOLS.has(toolName)
+      ? run
+      : (): Promise<string> => withPageLock(run);
+    const text = await guarded();
     await logEvent("tool_succeeded", {
       toolName,
       durationMs: Date.now() - startedAt,

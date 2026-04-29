@@ -20,6 +20,12 @@ NOVNC_BIND="${NOVNC_BIND:-0.0.0.0}"
 
 log() { printf '[entrypoint] %s\n' "$*" >&2; }
 
+# Clean up stale lock files from a previous run. `docker compose restart`
+# reuses the container's filesystem; if the previous Xvfb left a lockfile
+# behind, the new one refuses to start with "Server is already active".
+DISPLAY_NUM=${DISPLAY#:}
+rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" 2>/dev/null || true
+
 # Xvfb display
 log "starting Xvfb on ${DISPLAY} (${SCREEN_GEOM})"
 Xvfb "${DISPLAY}" -screen 0 "${SCREEN_GEOM}" -nolisten tcp -dpi 96 +extension RANDR &

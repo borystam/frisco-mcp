@@ -1,4 +1,4 @@
-import { getPage, getContext, getLastSearchContext } from "../browser.js";
+import { getPage, getContext, getLastSearchContext, productCache } from "../browser.js";
 import { ensureLoggedIn } from "../auth.js";
 import {
   dismissPopups,
@@ -612,6 +612,16 @@ function formatCartSnapshot(snapshot: CartSnapshot): string {
 export async function clearCart(): Promise<string> {
   try {
     const page = await getReadyCartPage();
+    // Snapshot first: when the cart is already empty, Frisco doesn't
+    // render a clear-cart button at all, and the previous fall-through
+    // produced a misleading "layout may have changed" warning.
+    const before = await getCartSnapshot(page);
+    if (before.items.length === 0) {
+      return [
+        "🛒 Cart already empty — nothing to clear.",
+        formatCartSnapshot(before),
+      ].join("\n");
+    }
     const wasClicked = await clearCartViaUi(page);
     const snapshot = await getCartSnapshot(page);
     const summary = formatCartSnapshot(snapshot);
@@ -671,16 +681,79 @@ export async function addItemsToCart(
     return "❌ Invalid input. Expected a JSON array of products.";
   }
 
-  const needsSearchContext = products.some((product) => !product.productUrl);
-  const searchContext = needsSearchContext ? getLastSearchContext() : null;
+  if (products.length === 0) {
+    return "❌ Empty items array — pass at least one product.";
+  }
+
+  // Quantity validation. Default missing → 1; reject 0, negatives, non-
+  // integers, NaN, and unreasonably high values up front so the user
+  // gets a clear schema-level error instead of Frisco's misleading
+  // "currently unavailable" downstream.
+  const QTY_MAX = 50;
+  const quantityErrors: string[] = [];
+  for (let i = 0; i < products.length; i++) {
+    const item = products[i];
+    if (!item || typeof item !== "object") {
+      quantityErrors.push(`item[${i}]: must be an object`);
+      continue;
+    }
+    if (typeof item.name !== "string" || item.name.trim().length === 0) {
+      quantityErrors.push(`item[${i}]: 'name' is required`);
+    }
+    if (item.quantity === undefined || item.quantity === null) {
+      item.quantity = 1;
+      continue;
+    }
+    if (
+      typeof item.quantity !== "number" ||
+      !Number.isFinite(item.quantity) ||
+      !Number.isInteger(item.quantity) ||
+      item.quantity <= 0
+    ) {
+      quantityErrors.push(
+        `item[${i}] (${item.name ?? "?"}): quantity must be a positive integer (got ${JSON.stringify(item.quantity)})`,
+      );
+      continue;
+    }
+    if (item.quantity > QTY_MAX) {
+      quantityErrors.push(
+        `item[${i}] (${item.name}): quantity ${item.quantity} exceeds max ${QTY_MAX}`,
+      );
+    }
+  }
+  if (quantityErrors.length > 0) {
+    return ["❌ Invalid input:", ...quantityErrors.map((e) => `   • ${e}`)].join(
+      "\n",
+    );
+  }
+
+  // We need *some* way to resolve each item's URL: explicit productUrl,
+  // a hit in productCache (accumulates across all searches in the
+  // session), or the latest search context. Only fail fast when none
+  // of those can possibly cover any item.
+  const cacheCanCover = (name: string | undefined): boolean => {
+    if (!name) return false;
+    if (productCache.has(name)) return true;
+    const wanted = name.toLowerCase();
+    for (const [k] of productCache.entries()) {
+      if (k.toLowerCase().includes(wanted) || wanted.includes(k.toLowerCase())) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const needsSearchContext = products.some(
+    (product) => !product.productUrl && !cacheCanCover(product.name),
+  );
+  const searchContext = getLastSearchContext();
   if (
     needsSearchContext &&
     (!searchContext || searchContext.results.length === 0)
   ) {
     return [
-      "❌ No saved search context found.",
-      "Run search_products first, then call add_items_to_cart with item names from that result list.",
-      "Or pass productUrl in each item to add directly from product pages.",
+      "❌ No way to resolve product URLs for some items.",
+      "Either: (a) call search_products / search_products_scored first so the item names are in the session cache, or",
+      "(b) pass productUrl in each item to add directly from product pages.",
     ].join("\n");
   }
 
@@ -729,7 +802,29 @@ export async function addItemsToCart(
         : 1;
 
     try {
-      const explicitUrl = item.productUrl?.trim();
+      // If the item has no productUrl, try the persistent productCache
+      // before requiring a fresh search context. Multi-search workflows
+      // (search milk, search bread, search butter, then add all at
+      // once) otherwise fail because only the LAST searchContext is
+      // available; the cache, however, accumulates {name → URL} from
+      // every prior search in the session.
+      let explicitUrl = item.productUrl?.trim();
+      if (!explicitUrl && item.name) {
+        const cached = productCache.get(item.name);
+        if (cached?.url) explicitUrl = cached.url;
+        // Also try a case-insensitive partial match — agents often
+        // shorten "ŁACIATE Mleko UHT 2% w butelce (świeże)" to
+        // "ŁACIATE Mleko 2%".
+        if (!explicitUrl) {
+          const wanted = item.name.toLowerCase();
+          for (const [k, v] of productCache.entries()) {
+            if (v.url && (k.toLowerCase().includes(wanted) || wanted.includes(k.toLowerCase()))) {
+              explicitUrl = v.url;
+              break;
+            }
+          }
+        }
+      }
       if (explicitUrl) {
         if (!isSameProductUrl(page.url(), explicitUrl)) {
           await page.goto(explicitUrl, { waitUntil: "domcontentloaded" });

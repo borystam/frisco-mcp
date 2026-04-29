@@ -39,10 +39,16 @@ jobs:
 
       - name: Run container in background
         run: |
+          # Bind 0.0.0.0 *inside* the container so docker's published
+          # port (host-side 127.0.0.1:3031) actually reaches the
+          # service. Binding 127.0.0.1 inside the container only
+          # accepts from the container's own loopback and is never
+          # reachable through `-p`. External scope is provided by
+          # the host-side publish + the bearer below.
           docker run -d --name frisco-ci \
             -p 127.0.0.1:3031:3031 \
             -e MCP_TRANSPORT=http \
-            -e MCP_HTTP_HOST=127.0.0.1 \
+            -e MCP_HTTP_HOST=0.0.0.0 \
             -e MCP_HTTP_PORT=3031 \
             -e MCP_HTTP_BEARER=ci-test-token \
             frisco-mcp:ci

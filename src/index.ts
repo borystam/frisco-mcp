@@ -32,10 +32,21 @@ import {
   tailLogs,
 } from "./logger.js";
 
-const server = new McpServer({
-  name: "frisco-mcp-ts",
-  version: "1.0.0",
-});
+// Tool registration is shared between the stdio singleton (long-lived) and
+// the per-session McpServer instances created by the HTTP transport. The
+// SDK's protocol layer cannot service multiple concurrent initialize
+// handshakes on a single McpServer, so the HTTP path builds a fresh server
+// per session via createServer().
+export function createServer(): McpServer {
+  const s = new McpServer({
+    name: "frisco-mcp-ts",
+    version: "1.0.0",
+  });
+  registerAllTools(s);
+  return s;
+}
+
+function registerAllTools(server: McpServer): void {
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -499,12 +510,7 @@ server.registerTool(
     );
   },
 );
-
-// Exported so tests and embedders can construct the server without binding
-// a transport. Re-running registers the same tools on a fresh instance.
-export function getServer(): McpServer {
-  return server;
-}
+} // end registerAllTools
 
 const SHUTDOWN_BUDGET_MS = 10_000;
 
@@ -524,12 +530,13 @@ async function run(): Promise<void> {
   let running: RunningServer;
   if (transportName === "http") {
     const opts = readEnvOptions();
-    const r: RunningHttpServer = await runHttp(server, opts);
+    const r: RunningHttpServer = await runHttp(createServer, opts);
     running = { close: () => r.close() };
   } else if (transportName === "stdio" || transportName === "") {
     const stdio = new StdioServerTransport();
-    await server.connect(stdio);
-    running = { close: async () => server.close() };
+    const stdioServer = createServer();
+    await stdioServer.connect(stdio);
+    running = { close: async () => stdioServer.close() };
   } else {
     throw new Error(
       `MCP_TRANSPORT must be 'stdio' or 'http', got ${JSON.stringify(transportName)}`,

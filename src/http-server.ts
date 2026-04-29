@@ -1,10 +1,11 @@
 // HTTP transport for the MCP server.
 //
-// Selected via MCP_TRANSPORT=http. Stateless, JSON-response mode (no SSE) —
-// the Frisco workload is request/response, not streaming, and statelessness
-// keeps the moving parts low. The browser singleton in src/browser.ts
-// persists across requests via module-level state, so request-level
-// statelessness has no functional cost.
+// Selected via MCP_TRANSPORT=http. Stateful, JSON-response mode (no SSE) —
+// the Frisco workload is request/response, not streaming. Stateful mode
+// means each MCP client's initialize → notifications/initialized → tool-call
+// sequence is bound to a Mcp-Session-Id, which the SDK's standard client
+// negotiates automatically. Stateless mode tripped the SDK's per-request
+// protocol layer for non-initialize requests.
 //
 // Hardening:
 //   - Bearer auth via constant-time compare (crypto.timingSafeEqual).
@@ -24,9 +25,10 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 export interface HttpServerOptions {
   host: string;
@@ -40,9 +42,10 @@ export interface HttpServerOptions {
 
 export interface RunningHttpServer {
   httpServer: Server;
-  transport: StreamableHTTPServerTransport;
   address: { host: string; port: number };
   close: () => Promise<void>;
+  // Read-only view; tests rely on it for liveness assertions.
+  readonly sessionCount: () => number;
 }
 
 const LOOPBACK_HOSTS = new Set([
@@ -196,17 +199,18 @@ function sendJsonError(res: ServerResponse, status: number, message: string): vo
 }
 
 export async function runHttp(
-  server: McpServer,
+  serverFactory: () => McpServer,
   options: HttpServerOptions,
 ): Promise<RunningHttpServer> {
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-    enableJsonResponse: true,
-  });
-  await server.connect(transport);
+  // Canonical SDK pattern for stateful Streamable HTTP: one McpServer per
+  // session. The protocol layer cannot service two concurrent initialize
+  // handshakes on a single McpServer (rejects with "Server already
+  // initialized"). We build a fresh server + transport pair on every new
+  // initialize and key them by the generated Mcp-Session-Id.
+  const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const httpServer = createHttpServer((req, res) => {
-    void handleRequest(req, res, transport, options).catch((err) => {
+    void handleRequest(req, res, serverFactory, transports, options).catch((err) => {
       process.stderr.write(
         `[frisco-mcp-http] request handler error: ${
           err instanceof Error ? err.message : String(err)
@@ -251,19 +255,22 @@ export async function runHttp(
 
   return {
     httpServer,
-    transport,
     address: { host: options.host, port: realPort },
+    sessionCount: () => transports.size,
     async close() {
       await new Promise<void>((resolve) => {
         httpServer.close(() => resolve());
         // Force-close idle keepalive sockets so we exit promptly.
         httpServer.closeAllConnections?.();
       });
-      try {
-        await transport.close();
-      } catch {
-        /* best effort */
+      for (const t of transports.values()) {
+        try {
+          await t.close();
+        } catch {
+          /* best effort */
+        }
       }
+      transports.clear();
     },
   };
 }
@@ -271,7 +278,8 @@ export async function runHttp(
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  transport: StreamableHTTPServerTransport,
+  serverFactory: () => McpServer,
+  transports: Map<string, StreamableHTTPServerTransport>,
   options: HttpServerOptions,
 ): Promise<void> {
   const method = req.method ?? "GET";
@@ -330,5 +338,36 @@ async function handleRequest(
     }
   }
 
-  await transport.handleRequest(req, res, parsedBody);
+  // Per-session transport dispatch.
+  const sessionHeader = req.headers["mcp-session-id"];
+  const sessionId = Array.isArray(sessionHeader) ? sessionHeader[0] : sessionHeader;
+
+  if (sessionId && transports.has(sessionId)) {
+    await transports.get(sessionId)!.handleRequest(req, res, parsedBody);
+    return;
+  }
+
+  if (method === "POST" && isInitializeRequest(parsedBody)) {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableJsonResponse: true,
+      onsessioninitialized: (sid) => {
+        transports.set(sid, transport);
+      },
+      onsessionclosed: (sid) => {
+        transports.delete(sid);
+      },
+    });
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid) transports.delete(sid);
+    };
+    const sessionServer = serverFactory();
+    await sessionServer.connect(transport);
+    await transport.handleRequest(req, res, parsedBody);
+    return;
+  }
+
+  // No session and not an initialize: spec says reject with 400.
+  sendJsonError(res, 400, "missing session — call initialize first");
 }

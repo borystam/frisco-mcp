@@ -39,19 +39,24 @@ RUN npm run build && npm prune --omit=dev
 
 # Drop into the unprivileged "pwuser" account that the Playwright image
 # already provisions; it owns the browser cache directory.
-RUN mkdir -p /home/pwuser/.frisco-mcp \
+RUN mkdir -p /home/pwuser/.frisco-mcp /tmp/.X11-unix \
  && chown -R pwuser:pwuser /app /home/pwuser/.frisco-mcp \
- && chmod 700 /home/pwuser/.frisco-mcp
+ && chmod 700 /home/pwuser/.frisco-mcp \
+ && chmod 1777 /tmp/.X11-unix
 
 COPY docker/entrypoint.sh /usr/local/bin/frisco-mcp-entrypoint
 RUN chmod +x /usr/local/bin/frisco-mcp-entrypoint
 
 USER pwuser
+# Bind 0.0.0.0 inside the container so docker port-forwarding can
+# reach it from the host. The host-side publish (compose / `docker
+# run -p`) is what actually scopes external access — keep that on
+# loopback (127.0.0.1:PORT:PORT) unless you also gate behind a bearer.
 ENV HOME=/home/pwuser \
     DISPLAY=:99 \
     NOVNC_PORT=6080 \
     MCP_TRANSPORT=http \
-    MCP_HTTP_HOST=127.0.0.1 \
+    MCP_HTTP_HOST=0.0.0.0 \
     MCP_HTTP_PORT=3031
 
 EXPOSE 3031 6080

@@ -32,18 +32,21 @@ async function startFixture(
     mcpPath: partial.mcpPath ?? "/mcp",
     healthPath: partial.healthPath ?? "/healthz",
   };
-  const server = new McpServer({ name: "frisco-mcp-test", version: "0.0.0" });
-  server.registerTool(
-    "ping",
-    {
-      description: "test ping tool",
-      inputSchema: { msg: z.string().optional() },
-    },
-    async ({ msg }) => ({
-      content: [{ type: "text", text: `pong:${msg ?? ""}` }],
-    }),
-  );
-  const running = await runHttp(server, opts);
+  const factory = (): McpServer => {
+    const s = new McpServer({ name: "frisco-mcp-test", version: "0.0.0" });
+    s.registerTool(
+      "ping",
+      {
+        description: "test ping tool",
+        inputSchema: { msg: z.string().optional() },
+      },
+      async ({ msg }) => ({
+        content: [{ type: "text", text: `pong:${msg ?? ""}` }],
+      }),
+    );
+    return s;
+  };
+  const running = await runHttp(factory, opts);
   return {
     running,
     baseUrl: `http://${running.address.host}:${running.address.port}`,

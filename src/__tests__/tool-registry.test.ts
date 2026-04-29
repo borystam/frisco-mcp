@@ -33,7 +33,11 @@ vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => {
   return {
     McpServer: class {
       registerTool(name: string, opts: { description?: string }, _handler: unknown) {
-        registered.push({ name, description: opts?.description });
+        // Each per-session McpServer registers the same set; collapse to a
+        // single occurrence per name so the snapshot stays stable.
+        if (!registered.some((r) => r.name === name)) {
+          registered.push({ name, description: opts?.description });
+        }
       }
       connect() {
         return Promise.resolve();

@@ -33,7 +33,10 @@ services:
     environment:
       # Transport selection: http or stdio.
       MCP_TRANSPORT: http
-      MCP_HTTP_HOST: 127.0.0.1
+      # Bind 0.0.0.0 INSIDE the container so docker can port-forward.
+      # External scoping is the host-side publish below (defaults to
+      # 127.0.0.1) plus the bearer.
+      MCP_HTTP_HOST: 0.0.0.0
       MCP_HTTP_PORT: 3031
 
       # REQUIRED if MCP_HTTP_HOST is non-loopback. Replace `changeme`

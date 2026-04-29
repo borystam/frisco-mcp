@@ -2,27 +2,21 @@
 #
 # Frisco MCP — generic container image for hosted deployment.
 #
-# Two-stage build:
-#   1. builder — Microsoft's Playwright base; installs all npm deps
-#      (incl. dev), compiles TypeScript, prunes dev deps.
-#   2. runtime — same Playwright base, with the X stack added and the
-#      unused Playwright browsers (Firefox, WebKit, bundled ffmpeg)
-#      stripped. Compiled output and pruned node_modules are copied
-#      from the builder.
+# Two-stage build atop `node:20-slim`. Stage 1 compiles TypeScript
+# and prunes dev deps; Stage 2 takes the slim node base, installs
+# only the system libs Chromium needs (via the upstream-blessed
+# `playwright install --with-deps chromium`), the X stack for headed
+# mode on a server, and copies the pre-built artefacts from the
+# builder. The full Playwright Docker image (which ships Firefox +
+# WebKit + dev deps) is avoided entirely — the result is roughly
+# half the size and well under the 2 GB CI budget.
 #
-# Why the same base on both sides: native bindings (e.g. anything that
-# resolves to a glibc-pinned binary) only need to match once because
-# only one base is pulled. The build-time Playwright + dev deps stay
-# in the builder layer and never reach the published image.
-#
-# The image is generic and contains NO deployment-specific values
+# This image is generic and contains NO deployment-specific values
 # (hosts, ports beyond defaults, tokens, account info). Any wiring
 # goes in the consumer's private deployment repo.
 
-ARG PLAYWRIGHT_VERSION=v1.59.0-jammy
-
 # ── Stage 1: builder ───────────────────────────────────────────────
-FROM mcr.microsoft.com/playwright:${PLAYWRIGHT_VERSION} AS builder
+FROM node:20-slim AS builder
 
 WORKDIR /app
 
@@ -36,37 +30,45 @@ RUN npm run build \
  && npm prune --omit=dev
 
 # ── Stage 2: runtime ───────────────────────────────────────────────
-FROM mcr.microsoft.com/playwright:${PLAYWRIGHT_VERSION} AS runtime
+FROM node:20-slim AS runtime
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# X stack and noVNC bundle. Xvfb is already present on the Playwright
-# image but we list it explicitly so the dependency is documented.
-# Strip Firefox / WebKit / bundled ffmpeg from the Playwright cache —
-# the app only uses Chromium (see src/browser.ts). This is the
-# largest single win on image size.
+# Unprivileged runtime user. Created up front so the chromium cache
+# created below ends up owned by it.
+RUN groupadd --system pwuser \
+ && useradd --system --gid pwuser --create-home --shell /bin/bash pwuser
+
+WORKDIR /app
+
+# Copy production node_modules + dist + manifest from the builder
+# stage. Source files (src/, tsconfig.json) and dev deps (typescript,
+# vitest, tsx, @types/node) stay behind in the builder.
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/dist ./dist
+
+# X stack + tini + ca-certs + chromium (with system libs).
+# `playwright install --with-deps chromium` is the upstream-blessed
+# way to install only what the browser needs — the Playwright base
+# image preinstalls all three browsers (Firefox + WebKit + Chromium)
+# plus their full dependency closure, which is nearly 2 GB on its
+# own. This installs only chromium and its required shared libs.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         xvfb x11vnc fluxbox tini \
         novnc websockify ca-certificates \
- && rm -rf /var/lib/apt/lists/* \
- && find /ms-playwright -mindepth 1 -maxdepth 1 -type d \
-        \( -iname 'firefox*' -o -iname 'webkit*' -o -iname 'ffmpeg*' \) \
-        -exec rm -rf {} +
+ && npx --yes playwright install --with-deps chromium \
+ && chown -R pwuser:pwuser /ms-playwright /app \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
+           /root/.npm /root/.cache \
+           /usr/share/doc /usr/share/man /usr/share/locale
 
-WORKDIR /app
-
-# Compiled output and pruned (production-only) node_modules from the
-# builder stage. Source files (src/, tsconfig.json) and dev deps stay
-# behind in the builder and never reach the published image.
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./package.json
-
-# Drop into the unprivileged "pwuser" account that the Playwright image
-# already provisions; it owns the browser cache directory.
+# Cookie/log mount-point + X socket dir.
 RUN mkdir -p /home/pwuser/.frisco-mcp /tmp/.X11-unix \
- && chown -R pwuser:pwuser /app /home/pwuser/.frisco-mcp \
+ && chown -R pwuser:pwuser /home/pwuser \
  && chmod 700 /home/pwuser/.frisco-mcp \
  && chmod 1777 /tmp/.X11-unix
 

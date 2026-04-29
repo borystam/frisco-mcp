@@ -95,6 +95,7 @@ const EXPECTED_TOOLS = [
   'update_item_quantity',
   'get_delivery_slots',
   'get_order_history',
+  'get_order_details',
 ] as const;
 
 describe('tool registry', () => {

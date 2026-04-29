@@ -361,3 +361,280 @@ export async function getOrderHistory(query?: OrderQuery): Promise<string> {
   const hist = await fetchOrderHistory();
   return formatOrderHistory(hist, query);
 }
+
+// ---------------------------------------------------------------------------
+// Order detail (line items)
+// ---------------------------------------------------------------------------
+//
+// Frisco renders past-order detail at /stn,orderCart/orderId,<id> as a
+// checkout-shaped page: one `.products-by-category_section` per category,
+// each containing newline-delimited product chunks ending with "Usuń"
+// (the per-row Remove button label). We parse the text blocks to extract
+// brand, name, size, and quantity — that's enough to build a "staples
+// checklist" or to compare two orders.
+//
+// We intentionally do NOT click the Remove buttons or do anything that
+// could mutate the historical order. Read-only.
+
+export interface OrderLineItem {
+  category: string;
+  brand: string;
+  name: string;
+  size: string | null;
+  /** Numeric quantity ordered. null when the line was "chwilowo niedostępny". */
+  quantity: number | null;
+  /** Sticker price string, e.g. "7,29 zł". */
+  priceText: string | null;
+  /** Numeric sticker price in PLN. */
+  priceValue: number | null;
+  /** True if the order line was on promotion. */
+  promo: boolean;
+  /** True if Frisco flagged the item as currently unavailable. */
+  unavailable: boolean;
+}
+
+export interface OrderDetail {
+  orderId: string;
+  url: string;
+  items: OrderLineItem[];
+  totalText: string | null;
+  totalValue: number | null;
+  itemCountText: string | null;
+}
+
+const ORDER_ID_PATTERN = /^\d{6,8}$/;
+const ORDER_DETAIL_BASE = 'https://www.frisco.pl/stn,orderCart/orderId,';
+
+function buildOrderDetailUrl(orderId: string): string {
+  // Accept the long form "1640647/260008" — Frisco's URL only takes the
+  // back half (the per-account sequence). Strip anything before "/".
+  const tail = orderId.includes('/') ? orderId.split('/').pop()! : orderId;
+  if (!ORDER_ID_PATTERN.test(tail)) {
+    throw new Error(`Invalid order id ${JSON.stringify(orderId)} — expected 6-8 digits, optionally prefixed with "<account>/".`);
+  }
+  return `${ORDER_DETAIL_BASE}${tail}`;
+}
+
+/**
+ * Pure parser for the per-section innerText emitted by the order detail
+ * page. Exposed for unit tests; used by fetchOrderDetail.
+ *
+ * Within a section's inner text, products are separated by the line
+ * "Usuń". Each chunk has roughly:
+ *
+ *   [Promocja]            optional promo banner line
+ *   BRAND                 first non-empty line
+ *   Product name          second line
+ *   <size>                "500 g", "1 l", "1 szt", "10 szt." …
+ *   <unit price>          "12,78 zł/kg" - sometimes absent
+ *   Cena | Cena promocyjna
+ *   <price>               "6,39 zł"
+ *   [<old price>]         only on promo
+ *   [najniższa cena z 30 dni …]
+ *   [Produkt chwilowo niedostępny]
+ *   <integer quantity>    only when in stock
+ *   <line-total>          "0,00 zł" on this view
+ *   Usuń                  line terminator
+ *   [Przydatny do …]      best-before, may follow Usuń
+ */
+export function parseOrderDetailSection(
+  category: string,
+  productsText: string,
+): OrderLineItem[] {
+  const lines = productsText.split('\n').map(l => l.trim()).filter(Boolean);
+  const items: OrderLineItem[] = [];
+  let buf: string[] = [];
+
+  const flush = (): void => {
+    if (buf.length === 0) return;
+
+    // Drop a leading "Promocja" badge line.
+    let promo = false;
+    if (buf[0]?.toLowerCase() === 'promocja') {
+      promo = true;
+      buf = buf.slice(1);
+    }
+    // Drop trailing "Przydatny do …" / "Przydatny ok." lines belonging
+    // to the previous item but inside this same chunk (rare).
+    buf = buf.filter(l => !/^przydatny\b/i.test(l));
+
+    if (buf.length < 2) {
+      buf = [];
+      return;
+    }
+
+    const brand = buf[0];
+    const name = buf[1];
+
+    const sizeRe = /^\d+[\d.,]*\s*(g|kg|ml|l|szt|szt\.)\b/i;
+    const size = buf.find(l => sizeRe.test(l)) ?? null;
+
+    const unavailable = buf.some(l => /chwilowo\s+niedostępny/i.test(l));
+    if (/cena\s+promocyjna/i.test(buf.join(' '))) promo = true;
+
+    let quantity: number | null = null;
+    if (!unavailable) {
+      // The quantity line is a bare positive integer that appears AFTER
+      // the price block. Walk lines from the end backwards, skipping the
+      // line-total ("0,00 zł") and "Usuń"; the first standalone
+      // positive integer is the quantity.
+      for (let i = buf.length - 1; i >= 0; i--) {
+        const l = buf[i];
+        if (/^\d+$/.test(l)) {
+          const n = parseInt(l, 10);
+          if (n > 0 && n < 1000) {
+            quantity = n;
+            break;
+          }
+        }
+      }
+    }
+
+    // Sticker price: first "X,YY zł" that is not "0,00 zł" (line total)
+    // and not the unit price ("X,YY zł/kg"). Capture the leftmost match.
+    let priceText: string | null = null;
+    for (const l of buf) {
+      const m = /^(\d[\d\s]*,\d{2})\s*zł$/.exec(l);
+      if (m && m[1].replace(/\s/g, '') !== '0,00') {
+        priceText = `${m[1].trim()} zł`;
+        break;
+      }
+    }
+    const priceValue = parsePricePln(priceText);
+
+    items.push({
+      category,
+      brand,
+      name,
+      size,
+      quantity,
+      priceText,
+      priceValue,
+      promo,
+      unavailable,
+    });
+
+    buf = [];
+  };
+
+  for (const line of lines) {
+    if (line === 'Usuń') {
+      flush();
+      continue;
+    }
+    buf.push(line);
+  }
+  // Trailing chunk shouldn't happen (all real items end with Usuń) but
+  // flush defensively.
+  flush();
+
+  return items;
+}
+
+export async function fetchOrderDetail(orderId: string): Promise<OrderDetail> {
+  const url = buildOrderDetailUrl(orderId);
+  const page = await getPage();
+  const context = await getContext();
+  await ensureLoggedIn(page, context);
+
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+  await page.waitForTimeout(SETTLE_MS);
+
+  const raw = await page.evaluate(() => {
+    const bodyText = document.body.innerText;
+    if (/\bnie\s+znaleźli[a-z]*\s+strony\b/i.test(bodyText)) {
+      return { url: window.location.href, sections: [], totalText: null, itemCountText: null, pageNotFound: true };
+    }
+    if (/\bzaloguj\b/i.test(bodyText) && !/wyloguj/i.test(bodyText)) {
+      return { url: window.location.href, sections: [], totalText: null, itemCountText: null, pageNotFound: true };
+    }
+
+    const sections = Array.from(
+      document.querySelectorAll<HTMLElement>('.products-by-category_section'),
+    ).map(section => {
+      const headerEl = section.querySelector<HTMLElement>('.products-by-category_section-category-header');
+      const productsEl = section.querySelector<HTMLElement>('.products-by-category_section-category-products');
+      const headerText = headerEl?.innerText?.trim() ?? '';
+      // Header is "Category\nN produkty"; take first line.
+      const category = headerText.split('\n')[0]?.trim() ?? 'Inne';
+      const productsText = productsEl?.innerText ?? '';
+      return { category, productsText };
+    });
+
+    // Total + item count from the order summary block at the bottom.
+    let totalText: string | null = null;
+    let itemCountText: string | null = null;
+    // "Do zapłaty\n267,13 zł"
+    const totalMatch = /do\s+zapłaty[\s\n]+([\d\s]+,\d{2}\s*zł)/i.exec(bodyText);
+    if (totalMatch) totalText = totalMatch[1].replace(/\s+/g, ' ').trim();
+    // "Koszyk (18 produktów)"
+    const countMatch = /koszyk\s*\(\s*(\d+)\s+produkt[óa-z]*\)/i.exec(bodyText);
+    if (countMatch) itemCountText = countMatch[1];
+
+    return { url: window.location.href, sections, totalText, itemCountText, pageNotFound: false };
+  });
+
+  if (raw.pageNotFound) {
+    throw new OrderPageNotFoundError(
+      `Order detail page not found at ${raw.url}. Either the order id is wrong, ` +
+        `the order doesn't belong to this account, or Frisco moved /stn,orderCart again.`,
+    );
+  }
+
+  const items: OrderLineItem[] = [];
+  for (const s of raw.sections) {
+    items.push(...parseOrderDetailSection(s.category, s.productsText));
+  }
+
+  return {
+    orderId,
+    url: raw.url,
+    items,
+    totalText: raw.totalText,
+    totalValue: parsePricePln(raw.totalText),
+    itemCountText: raw.itemCountText,
+  };
+}
+
+export function formatOrderDetail(detail: OrderDetail): string {
+  if (detail.items.length === 0) {
+    return [
+      `❌ No line items parsed for order ${detail.orderId}.`,
+      `   Page URL: ${detail.url}`,
+      `   This usually means the page rendered but the parser missed the markup —`,
+      `   share a screenshot if the order is real.`,
+    ].join('\n');
+  }
+  const out: string[] = [
+    `📦 Order ${detail.orderId} — ${detail.items.length} line${detail.items.length === 1 ? '' : 's'}` +
+      (detail.itemCountText ? ` (${detail.itemCountText} products on receipt)` : '') +
+      (detail.totalText ? ` — ${detail.totalText}` : ''),
+    '',
+  ];
+  // Group by category for readability.
+  const byCat = new Map<string, OrderLineItem[]>();
+  for (const item of detail.items) {
+    const arr = byCat.get(item.category) ?? [];
+    arr.push(item);
+    byCat.set(item.category, arr);
+  }
+  for (const [cat, arr] of byCat) {
+    out.push(`▸ ${cat}`);
+    for (const it of arr) {
+      const qtyPart = it.unavailable
+        ? '(unavailable)'
+        : it.quantity != null
+          ? `×${it.quantity}`
+          : '×?';
+      const sizePart = it.size ? ` — ${it.size}` : '';
+      const pricePart = it.priceText ? ` — ${it.priceText}${it.promo ? ' (promo)' : ''}` : '';
+      out.push(`   • ${qtyPart} ${it.brand} ${it.name}${sizePart}${pricePart}`);
+    }
+  }
+  return out.join('\n');
+}
+
+export async function getOrderDetails(orderId: string): Promise<string> {
+  const detail = await fetchOrderDetail(orderId);
+  return formatOrderDetail(detail);
+}

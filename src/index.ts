@@ -22,7 +22,7 @@ import {
   getProductReviews,
 } from "./tools/products.js";
 import { getDeliverySlots } from "./tools/delivery.js";
-import { getOrderHistory } from "./tools/orders.js";
+import { getOrderHistory, getOrderDetails } from "./tools/orders.js";
 import {
   initLogger,
   logEvent,
@@ -527,6 +527,27 @@ server.registerTool(
       "get_order_history",
       { fromDate, toDate, status, minTotalPln, limit },
       () => getOrderHistory({ fromDate, toDate, status, minTotalPln, limit }),
+    );
+  },
+);
+
+server.registerTool(
+  "get_order_details",
+  {
+    description:
+      "Returns the line items of a single past Frisco order: brand, product name, size, quantity, price, and promo flag, grouped by category. Pass the order id from get_order_history (either the long form '1640647/260008' or just the trailing '260008'). Use this to build a 'staples checklist' from past orders or to compare two shops.",
+    inputSchema: {
+      orderId: z
+        .string()
+        .min(6)
+        .describe(
+          "Order id from get_order_history. Long form '1640647/260008' or short '260008' both accepted.",
+        ),
+    },
+  },
+  async ({ orderId }) => {
+    return executeTool("get_order_details", { orderId }, () =>
+      getOrderDetails(orderId),
     );
   },
 );

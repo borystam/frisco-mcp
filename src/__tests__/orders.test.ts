@@ -5,6 +5,7 @@ import {
   queryOrders,
   summariseSpend,
   formatOrderHistory,
+  parseOrderDetailSection,
   type OrderHistory,
 } from '../tools/orders.js';
 
@@ -156,5 +157,104 @@ describe('formatOrderHistory', () => {
     const h = normaliseOrderHistory(URL, sampleRaw, [], TODAY);
     const out = formatOrderHistory(h);
     expect(out).toContain('https://www.frisco.pl/order/1001');
+  });
+});
+
+describe('parseOrderDetailSection', () => {
+  // Captured 2026-04-29 from live frisco order detail page (BRAND-X
+  // placeholders so no real product text leaks into the test fixture).
+  const TWO_ITEMS_PLAIN = [
+    'BRAND-A',
+    'Test product alpha',
+    '500 g',
+    '12,78 zł/kg',
+    'Cena',
+    '6,39 zł',
+    '1',
+    '0,00 zł',
+    'Usuń',
+    'Przydatny do 26-11-2028',
+    'BRAND-B',
+    'Test product beta',
+    '340 g',
+    '20,56 zł/kg',
+    'Cena',
+    '6,99 zł',
+    '1',
+    '0,00 zł',
+    'Usuń',
+    'Przydatny do 31-08-2028',
+  ].join('\n');
+
+  it('extracts brand, name, size, quantity from plain Cena rows', () => {
+    const items = parseOrderDetailSection('Spiżarnia', TWO_ITEMS_PLAIN);
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({
+      category: 'Spiżarnia',
+      brand: 'BRAND-A',
+      name: 'Test product alpha',
+      size: '500 g',
+      quantity: 1,
+      priceText: '6,39 zł',
+      promo: false,
+      unavailable: false,
+    });
+    expect(items[1]).toMatchObject({
+      brand: 'BRAND-B',
+      name: 'Test product beta',
+      size: '340 g',
+      quantity: 1,
+    });
+  });
+
+  it('flags promo lines and quantity > 1', () => {
+    const promoChunk = [
+      'Promocja',
+      'BRAND-C',
+      'Test product gamma',
+      '140 g',
+      '52,07 zł/kg',
+      'Cena promocyjna',
+      '7,29 zł',
+      '7,39 zł',
+      'najniższa cena z 30 dni przed obniżką',
+      '4',
+      '0,00 zł',
+      'Usuń',
+      'Przydatny do 14-05-2026',
+    ].join('\n');
+    const items = parseOrderDetailSection('Mięso i wędliny', promoChunk);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      brand: 'BRAND-C',
+      promo: true,
+      quantity: 4,
+      priceText: '7,29 zł',
+    });
+  });
+
+  it('marks chwilowo niedostępny rows as unavailable with null quantity', () => {
+    const unavailChunk = [
+      'BRAND-D',
+      'Test product delta',
+      '1 l',
+      '11,69 zł/l',
+      'Cena',
+      '11,69 zł',
+      'Produkt chwilowo niedostępny',
+      '0,00 zł',
+      'Usuń',
+    ].join('\n');
+    const items = parseOrderDetailSection('Napoje', unavailChunk);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      unavailable: true,
+      quantity: null,
+      priceText: '11,69 zł',
+    });
+  });
+
+  it('returns an empty list for empty input', () => {
+    expect(parseOrderDetailSection('Inne', '')).toEqual([]);
   });
 });

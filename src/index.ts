@@ -213,7 +213,7 @@ server.registerTool(
           ),
         ])
         .describe(
-          'Array of items (or its stringified JSON form), e.g. [{"name":"PIĄTNICA Skyr","quantity":2}] or [{"name":"...","productUrl":"https://www.frisco.pl/pid,...","quantity":1}]',
+          'Array of items (or its stringified JSON form), e.g. [{"name":"<exact name from search results>","quantity":2}] or [{"name":"...","productUrl":"https://www.frisco.pl/pid,...","quantity":1}]',
         ),
       clearCartFirst: z
         .boolean()

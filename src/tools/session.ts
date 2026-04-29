@@ -137,7 +137,8 @@ export async function login(): Promise<string> {
           '✅ Logged in successfully! Session cookies saved to ' +
           SESSION_PATH +
           '\n\nYou can now use cart and product tools. ' +
-          'The browser window will stay open — close it manually or use clear_session.'
+          'The browser window will stay open — close it manually or use clear_session.' +
+          '\n\nNEXT: if the user asked you to log in as part of a larger task, immediately continue with the next step (search, view_cart, etc.). Do not stop here.'
         );
       }
     }

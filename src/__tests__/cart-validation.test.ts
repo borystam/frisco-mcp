@@ -182,8 +182,8 @@ describe('addItemsToCart — small-model schema tolerance', () => {
 describe('addItemsToCart — productCache fallback for multi-search workflows', () => {
   it('does not require a fresh searchContext when every item is in productCache (exact match)', async () => {
     const cache = new Map([
-      ['ŁACIATE Mleko UHT 2%', { name: 'ŁACIATE Mleko UHT 2%', url: 'https://www.frisco.pl/pid,1/', price: '', weight: null, macros: {}, ingredients: null }],
-      ['PUTKA Chleb', { name: 'PUTKA Chleb', url: 'https://www.frisco.pl/pid,2/', price: '', weight: null, macros: {}, ingredients: null }],
+      ['BRAND-A Test Product', { name: 'BRAND-A Test Product', url: 'https://www.frisco.pl/pid,1/', price: '', weight: null, macros: {}, ingredients: null }],
+      ['BRAND-B Test Product', { name: 'BRAND-B Test Product', url: 'https://www.frisco.pl/pid,2/', price: '', weight: null, macros: {}, ingredients: null }],
     ]);
     vi.doMock('../browser.js', () => ({
       getPage: vi.fn(() => { throw new Error('past-the-gate sentinel'); }),
@@ -201,15 +201,15 @@ describe('addItemsToCart — productCache fallback for multi-search workflows', 
     // that the gate let it through. The OLD code returned a
     // "No saved search context" string without ever calling getPage.
     await expect(
-      addItemsToCart('[{"name":"ŁACIATE Mleko UHT 2%","quantity":1},{"name":"PUTKA Chleb","quantity":1}]'),
+      addItemsToCart('[{"name":"BRAND-A Test Product","quantity":1},{"name":"BRAND-B Test Product","quantity":1}]'),
     ).rejects.toThrow(/past-the-gate sentinel/);
     vi.doUnmock('../browser.js');
     vi.resetModules();
   });
 
-  it('partial substring match: cached "Mleko 2%" is reachable as item "Mleko"', async () => {
+  it('partial substring match: cached "Sample Item Variant 2" is reachable as item "Sample Item"', async () => {
     const cache = new Map([
-      ['Mleko 2%', { name: 'Mleko 2%', url: 'https://www.frisco.pl/pid,1/', price: '', weight: null, macros: {}, ingredients: null }],
+      ['Sample Item Variant 2', { name: 'Sample Item Variant 2', url: 'https://www.frisco.pl/pid,1/', price: '', weight: null, macros: {}, ingredients: null }],
     ]);
     vi.doMock('../browser.js', () => ({
       getPage: vi.fn(() => { throw new Error('past-the-gate sentinel'); }),
@@ -223,7 +223,7 @@ describe('addItemsToCart — productCache fallback for multi-search workflows', 
     vi.resetModules();
     const { addItemsToCart } = await import('../tools/cart.js');
     await expect(
-      addItemsToCart('[{"name":"Mleko","quantity":1}]'),
+      addItemsToCart('[{"name":"Sample Item","quantity":1}]'),
     ).rejects.toThrow(/past-the-gate sentinel/);
     vi.doUnmock('../browser.js');
     vi.resetModules();

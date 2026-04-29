@@ -978,8 +978,8 @@ export async function addItemsToCart(
         const cached = productCache.get(item.name);
         if (cached?.url) explicitUrl = cached.url;
         // Also try a case-insensitive partial match — agents often
-        // shorten "ŁACIATE Mleko UHT 2% w butelce (świeże)" to
-        // "ŁACIATE Mleko 2%".
+        // shorten a long product title (full brand + variant + size) to
+        // a shorter agent-friendly form when calling add_items_to_cart.
         if (!explicitUrl) {
           const wanted = item.name.toLowerCase();
           for (const [k, v] of productCache.entries()) {
@@ -1196,12 +1196,22 @@ export async function addItemsToCart(
           "ℹ️ Reconciliation note: the click reported failure for some items but the cart shows they landed (Frisco UI race).",
         ]
       : [];
+  // Chain hint: keep the agent honest. After a cart write, the next
+  // call should be view_cart to verify ground truth — not a status
+  // announcement, not a final message. This line gets the model's
+  // attention and lifts long-horizon completion rates.
+  const nextStepHint =
+    addedCount === products.length
+      ? "✅ NEXT: call view_cart to confirm the items landed and surface the totals to the user."
+      : "⚠️ NEXT: call view_cart now — some items may have landed despite the failure messages above (Frisco UI race). The cart is the source of truth.";
   return [
     `🛒 Added ${addedCount}/${products.length} items:`,
     "",
     ...aliasBanner,
     results.join("\n"),
     ...recoveryBanner,
+    "",
+    nextStepHint,
     "",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "⚠️ Payment is YOUR responsibility.",
@@ -1297,7 +1307,12 @@ export async function removeItemFromCart(productName: string): Promise<string> {
     }
 
     await page.waitForTimeout(1_000);
-    return `🗑️ Removed "${removedName}" from cart.\n👉 ${CART_URL}`;
+    return [
+      `🗑️ Removed "${removedName}" from cart.`,
+      `👉 ${CART_URL}`,
+      ``,
+      `NEXT: call view_cart to confirm the cart now reflects the removal.`,
+    ].join("\n");
   } catch (error) {
     return `❌ Failed to remove item: ${getErrorMessage(error)}`;
   }
@@ -1466,9 +1481,14 @@ export async function updateItemQuantity(
     }, needle);
 
     if (finalQty && Number(finalQty) === quantity) {
-      return `✅ Quantity for "${foundName}" changed to ${quantity} (was ${fillResult.before ?? "?"}).\n👉 ${CART_URL}`;
+      return [
+        `✅ Quantity for "${foundName}" changed to ${quantity} (was ${fillResult.before ?? "?"}).`,
+        `👉 ${CART_URL}`,
+        ``,
+        `NEXT: call view_cart to confirm the new totals.`,
+      ].join("\n");
     }
-    return `⚠️ Quantity change for "${foundName}" did not stick — cart still shows ${finalQty ?? "?"} (expected ${quantity}). Try remove + re-add instead.`;
+    return `⚠️ Quantity change for "${foundName}" did not stick — cart still shows ${finalQty ?? "?"} (expected ${quantity}). NEXT: call remove_item_from_cart for "${foundName}" then add_items_to_cart with the desired quantity.`;
   } catch (error) {
     return `❌ Failed to update quantity: ${getErrorMessage(error)}`;
   }

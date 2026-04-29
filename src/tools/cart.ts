@@ -916,13 +916,32 @@ export async function addItemsToCart(
 
   const results: string[] = [];
 
+  // Parallel structured per-item record. Used to reconcile against a
+  // post-loop cart snapshot: F2 races where Frisco's UI ate the
+  // success-confirmation but the item was added on the server side
+  // are upgraded from "warn" to "ok-recovered".
+  type Attempt = {
+    name: string;
+    quantity: number;
+    status: AddItemProgressEvent['status'];
+    resultIndex: number; // index into `results` so we can rewrite the line
+  };
+  const attempts: Attempt[] = [];
+
   const emit = (
     item: CartItem,
     indexZero: number,
     status: AddItemProgressEvent['status'],
     message: string,
   ) => {
+    const resultIndex = results.length;
     results.push(message);
+    attempts.push({
+      name: item.name ?? "?",
+      quantity: typeof item.quantity === "number" ? item.quantity : 1,
+      status,
+      resultIndex,
+    });
     if (options.onProgress) {
       try {
         options.onProgress({
@@ -1125,6 +1144,42 @@ export async function addItemsToCart(
     }
   }
 
+  // F2 reconciliation: when Frisco's UI eats a click-success
+  // confirmation and `addProductFromCurrentProductPage` returns
+  // `{ok:false}`, the item often DID land on the server side. Snapshot
+  // the cart once at the end and upgrade any 'warn' attempt whose name
+  // is now in the cart from "warn" to "ok-recovered". This stops the
+  // tool from contradicting itself ("Added 0/1") when `view_cart` will
+  // show the item.
+  const recoveredNames: string[] = [];
+  if (attempts.some((a) => a.status === "warn")) {
+    try {
+      const finalSnap = await getCartSnapshot(page);
+      const inCart = (needle: string): { name: string; qty: string } | null => {
+        const wanted = needle.toLowerCase();
+        for (const entry of finalSnap.items) {
+          const have = entry.name.toLowerCase();
+          if (have === wanted || have.includes(wanted) || wanted.includes(have)) {
+            return entry;
+          }
+        }
+        return null;
+      };
+      for (const a of attempts) {
+        if (a.status !== "warn") continue;
+        const found = inCart(a.name);
+        if (found) {
+          a.status = "ok";
+          results[a.resultIndex] =
+            `✅ ${found.name} ×${found.qty} (recovered: tool-side click race; cart confirms it landed)`;
+          recoveredNames.push(found.name);
+        }
+      }
+    } catch {
+      // best-effort; if cart snapshot fails we keep the original warns
+    }
+  }
+
   const addedCount = results.filter((line) => line.startsWith("✅")).length;
   const aliasBanner =
     aliasWarnings.length > 0
@@ -1134,11 +1189,19 @@ export async function addItemsToCart(
           "",
         ]
       : [];
+  const recoveryBanner =
+    recoveredNames.length > 0
+      ? [
+          "",
+          "ℹ️ Reconciliation note: the click reported failure for some items but the cart shows they landed (Frisco UI race).",
+        ]
+      : [];
   return [
     `🛒 Added ${addedCount}/${products.length} items:`,
     "",
     ...aliasBanner,
     results.join("\n"),
+    ...recoveryBanner,
     "",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "⚠️ Payment is YOUR responsibility.",
@@ -1305,23 +1368,107 @@ export async function updateItemQuantity(
       return `⚠️ Product "${productName}" was not found in the cart.`;
     }
 
-    const quantityInput = page
-      .locator(
-        `.mini-product-box_wrapper.in-cart:has(a[title*="${foundName}" i]) .cart-button_quantity`,
-      )
-      .first();
+    // F1 fix: Frisco's selector with `:has(a[title*=... i])` was
+    // missing the quantity input even when it existed (Polish chars +
+    // punctuation in the title attribute didn't survive Playwright's
+    // selector parser). Drive the fill via page.evaluate, scoped to
+    // the matching cart row by name.lower-includes — same pattern the
+    // cart-parser successfully uses elsewhere.
+    type FillResult =
+      | { kind: "filled"; before: string | null; after: string | null }
+      | { kind: "no-input"; currentQty: string | null }
+      | { kind: "no-row" };
 
+    const fillResult = await page.evaluate(
+      ({ target, qty }: { target: string; qty: number }): FillResult => {
+        const boxes = Array.from(
+          document.querySelectorAll<HTMLElement>(
+            ".mini-product-box_wrapper.in-cart, article.horizontal-product-box__wrapper",
+          ),
+        );
+        for (const box of boxes) {
+          const nameLink = box.querySelector<HTMLAnchorElement>("a[title]");
+          const titledImg = box.querySelector<HTMLImageElement>("img[title]");
+          const haystack = (
+            (nameLink?.title ?? "") +
+            " " +
+            (titledImg?.title ?? "")
+          ).toLowerCase();
+          if (!haystack.includes(target)) continue;
+          const qInput = box.querySelector<HTMLInputElement>(
+            "input.cart-button_quantity, input[type='number']",
+          );
+          if (!qInput) {
+            return { kind: "no-input", currentQty: null };
+          }
+          const before = qInput.value;
+          // Native setter to bypass React's value-tracker (Frisco uses
+          // React; a naïve .value = X is silently reverted).
+          const proto = Object.getPrototypeOf(qInput) as { __proto__?: object };
+          const setter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            "value",
+          )?.set;
+          if (setter) {
+            setter.call(qInput, String(qty));
+          } else {
+            qInput.value = String(qty);
+          }
+          // Dispatch the events React listens for (input + change).
+          qInput.dispatchEvent(new Event("input", { bubbles: true }));
+          qInput.dispatchEvent(new Event("change", { bubbles: true }));
+          // Trigger Frisco's per-row handlers.
+          qInput.blur();
+          void proto;
+          return { kind: "filled", before, after: qInput.value };
+        }
+        return { kind: "no-row" };
+      },
+      { target: needle, qty: quantity },
+    );
+
+    if (fillResult.kind === "no-row") {
+      return `⚠️ Product "${productName}" was not found in the cart (post-locate check failed).`;
+    }
+    if (fillResult.kind === "no-input") {
+      return `⚠️ Cannot change quantity for "${foundName}" — quantity input was not found in the cart row.`;
+    }
     if (
-      !(await quantityInput.isVisible({ timeout: 3_000 }).catch(() => false))
+      fillResult.before &&
+      Number(fillResult.before) === quantity
     ) {
-      return `⚠️ Cannot change quantity for "${foundName}" — quantity input was not found.`;
+      return `✅ Quantity for "${foundName}" was already ${quantity}.\n👉 ${CART_URL}`;
     }
 
-    await quantityInput.fill(String(quantity));
-    await quantityInput.press("Enter");
+    // Give Frisco a moment to round-trip the change, then re-read.
     await page.waitForTimeout(1_500);
+    const finalQty = await page.evaluate((target: string) => {
+      const boxes = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          ".mini-product-box_wrapper.in-cart, article.horizontal-product-box__wrapper",
+        ),
+      );
+      for (const box of boxes) {
+        const nameLink = box.querySelector<HTMLAnchorElement>("a[title]");
+        const titledImg = box.querySelector<HTMLImageElement>("img[title]");
+        const haystack = (
+          (nameLink?.title ?? "") +
+          " " +
+          (titledImg?.title ?? "")
+        ).toLowerCase();
+        if (!haystack.includes(target)) continue;
+        const qInput = box.querySelector<HTMLInputElement>(
+          "input.cart-button_quantity, input[type='number']",
+        );
+        return qInput?.value ?? null;
+      }
+      return null;
+    }, needle);
 
-    return `✅ Quantity for "${foundName}" changed to ${quantity}.\n👉 ${CART_URL}`;
+    if (finalQty && Number(finalQty) === quantity) {
+      return `✅ Quantity for "${foundName}" changed to ${quantity} (was ${fillResult.before ?? "?"}).\n👉 ${CART_URL}`;
+    }
+    return `⚠️ Quantity change for "${foundName}" did not stick — cart still shows ${finalQty ?? "?"} (expected ${quantity}). Try remove + re-add instead.`;
   } catch (error) {
     return `❌ Failed to update quantity: ${getErrorMessage(error)}`;
   }

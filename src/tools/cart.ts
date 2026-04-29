@@ -288,11 +288,23 @@ async function addProductFromCurrentProductPage(
     };
   }
 
+  // Verify the click actually landed by reading the quantity input
+  // back. Frisco intermittently dismisses popups or otherwise eats the
+  // click — the button visibly clicks but no cart line appears. Without
+  // this check we'd report ✅ to the agent and the agent would tell the
+  // user "added" when nothing happened.
   const finalQty = await quantityInput
     .inputValue()
     .catch(() => null);
-
-  return { ok: true, reason: finalQty ? `quantity: ${finalQty}` : undefined };
+  const numericQty = finalQty ? Number(finalQty) : 0;
+  if (!finalQty || !Number.isFinite(numericQty) || numericQty <= 0) {
+    return {
+      ok: false,
+      reason:
+        "click went through but the product page's quantity input still reads 0 — the cart probably did not accept it (popup blocking? out-of-stock?). Re-run after dismissing popups, or fall back to the cart-page reconciliation",
+    };
+  }
+  return { ok: true, reason: `quantity: ${finalQty}` };
 }
 
 function pickResultForCartItem(
@@ -1144,20 +1156,24 @@ export async function addItemsToCart(
     }
   }
 
-  // F2 reconciliation: when Frisco's UI eats a click-success
-  // confirmation and `addProductFromCurrentProductPage` returns
-  // `{ok:false}`, the item often DID land on the server side. Snapshot
-  // the cart once at the end and upgrade any 'warn' attempt whose name
-  // is now in the cart from "warn" to "ok-recovered". This stops the
-  // tool from contradicting itself ("Added 0/1") when `view_cart` will
-  // show the item.
+  // F2 reconciliation, upgrade-only direction:
+  //  • warn → ok-recovered when the cart actually has the item — Frisco
+  //    sometimes eats the click-success signal but lands the add anyway.
+  //
+  // We deliberately do NOT downgrade ok → warn here. The cart page
+  // takes a few seconds to reflect a fresh add (Frisco's
+  // server→client propagation is async); a snapshot taken immediately
+  // can show "empty" even when the add succeeded. The trustworthy
+  // success signal lives upstream: addProductFromCurrentProductPage
+  // now verifies the product-page quantity input is > 0 before
+  // returning ok. Trust that.
   const recoveredNames: string[] = [];
   if (attempts.some((a) => a.status === "warn")) {
     try {
-      const finalSnap = await getCartSnapshot(page);
+      const snap = await getCartSnapshot(page);
       const inCart = (needle: string): { name: string; qty: string } | null => {
         const wanted = needle.toLowerCase();
-        for (const entry of finalSnap.items) {
+        for (const entry of snap.items) {
           const have = entry.name.toLowerCase();
           if (have === wanted || have.includes(wanted) || wanted.includes(have)) {
             return entry;
@@ -1176,7 +1192,7 @@ export async function addItemsToCart(
         }
       }
     } catch {
-      // best-effort; if cart snapshot fails we keep the original warns
+      // best-effort
     }
   }
 

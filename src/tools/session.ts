@@ -131,7 +131,15 @@ export async function login(): Promise<string> {
         );
       });
 
-      if (hasAccountEl || url === 'https://www.frisco.pl/' || url === 'https://www.frisco.pl/stn,home') {
+      // Frisco's old /stn,home redirect target now 404s — accept any
+      // landing on the root or any /stn,home (legacy) as a successful
+      // post-login redirect.
+      const onHome =
+        url === 'https://www.frisco.pl/' ||
+        url === 'https://www.frisco.pl' ||
+        url.startsWith('https://www.frisco.pl/?') ||
+        url.includes('/stn,home');
+      if (hasAccountEl || onHome) {
         await saveSession(context);
         return (
           '✅ Logged in successfully! Session cookies saved to ' +

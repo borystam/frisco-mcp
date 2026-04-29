@@ -41,12 +41,27 @@ export async function restoreSession(context: BrowserContext): Promise<boolean> 
 
 export async function isLoggedIn(context: BrowserContext): Promise<boolean> {
   try {
-    const response = await context.request.get('https://www.frisco.pl/stn,user-account', {
-      timeout: 12_000,
-      failOnStatusCode: false,
-    });
+    // Frisco moved the account page from /stn,user-account →
+    // /stn,settings/sub,myAccount sometime before 2026-04-29. The
+    // legacy path silently 404s; with `status() < 500` we'd
+    // false-positive that as "logged in". Use the live page so a real
+    // logged-out state — which redirects to /login — actually surfaces.
+    const response = await context.request.get(
+      'https://www.frisco.pl/stn,settings/sub,myAccount',
+      {
+        timeout: 12_000,
+        failOnStatusCode: false,
+      },
+    );
     const finalUrl = response.url();
-    if (finalUrl.includes('/login') || finalUrl.includes('/stn,login')) return false;
+    if (
+      finalUrl.includes('/login') ||
+      finalUrl.includes('/stn,login') ||
+      finalUrl === 'https://www.frisco.pl/' ||
+      finalUrl === 'https://www.frisco.pl'
+    ) {
+      return false;
+    }
     return response.status() < 500;
   } catch {
     return true;

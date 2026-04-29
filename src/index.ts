@@ -492,7 +492,7 @@ server.registerTool(
   "get_order_history",
   {
     description:
-      "Reads the user's past Frisco orders from /stn,user-orders and returns a summary list (order ID, placed-at, status, total) plus a spend total. Optional filters: fromDate, toDate (ISO YYYY-MM-DD), status substring, minTotalPln, limit.",
+      "Reads the user's past Frisco orders from /stn,settings/sub,history and returns a summary list (order ID, placed-at, status, total) plus a spend total. Optional filters: fromDate, toDate (ISO YYYY-MM-DD), status substring, minTotalPln, limit.",
     inputSchema: {
       fromDate: z
         .string()

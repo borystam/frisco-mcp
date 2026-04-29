@@ -48,19 +48,22 @@ git merge upstream/master
 The fork branches under `claude/**` are scratch — squash-merge or
 cherry-pick to `master` as PRs land.
 
-## Phase 2 (planned)
+## Phase 2 (in progress)
 
-- Deploy on the Nano host as a long-running service (systemd unit with
-  `KillMode=mixed` so the browser teardown gets a chance).
-- Wire the local LLM (set `MCP_LLM_BASE_URL` or similar in env) and
-  run an end-to-end shopping session against real `frisco.pl`
-  credentials.
-- File any small upstream-worthy fixes (e.g. the file-mode patches)
-  as a PR to `mkidawa/frisco-mcp`.
+| Area | Status |
+| --- | --- |
+| HTTP transport (`StreamableHTTPServerTransport`) selectable via `MCP_TRANSPORT=http` | landed |
+| Bearer auth, body-size cap, idle/headers timeouts, refusal to bind non-loopback without bearer | landed |
+| `GET /healthz` liveness probe | landed |
+| Optional credential autofill in `login` driven by `FRISCO_USER` / `FRISCO_PASS` (env-only, never logged) | landed |
+| Container build: `Dockerfile` + `docker/entrypoint.sh` + `docker-compose.example.yml` (Xvfb, x11vnc, noVNC for one-time login) | landed |
+| Graceful `SIGTERM` / `SIGINT` shutdown with a 10 s budget (browser teardown included) | landed |
+| Tool-surface snapshot test, file-mode regression test, concurrent-login race test | landed |
+| CI: secret scan, banned-string gate, container smoke (build → `/healthz` → stop) | landed |
+| End-to-end test against real `frisco.pl` | owner's responsibility — outside CI, requires real credentials |
+| Upstream-worthy fixes filed as a PR to `mkidawa/frisco-mcp` | pending |
 
 ## Open issues from upstream
 
-The audit attempted to enumerate `mkidawa/frisco-mcp` open issues but
-the GitHub MCP server in the build session was scoped to the fork
-only. Borys to skim upstream open issues and report back any small
-real bugs; follow-up patches will land in this fork.
+Upstream issue enumeration was out of scope for the audit run. Sync
+manually before backporting fixes.

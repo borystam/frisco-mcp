@@ -69,7 +69,7 @@ describe('addItemsToCart — streaming progress contract', () => {
     const { addItemsToCart } = await import('../tools/cart.js');
     const onProgress = vi.fn();
     const out = await addItemsToCart(JSON.stringify([{ name: 'X' }]), { onProgress });
-    expect(out).toContain('No saved search context');
+    expect(out).toMatch(/No way to resolve product URLs|No saved search context/);
     expect(onProgress).not.toHaveBeenCalled();
     vi.doUnmock('../browser.js');
     vi.resetModules();

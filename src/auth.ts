@@ -54,8 +54,6 @@ export async function isLoggedIn(context: BrowserContext): Promise<boolean> {
 }
 
 export async function ensureLoggedIn(page: Page, context: BrowserContext): Promise<void> {
-  void page;
-
   const restored = await restoreSession(context);
   if (!restored) {
     throw new Error(
@@ -67,6 +65,25 @@ export async function ensureLoggedIn(page: Page, context: BrowserContext): Promi
     throw new Error(
       'Session expired or invalid. Please run the "login" tool again to re-authenticate.'
     );
+  }
+  // Make sure the page is parked on frisco.pl before the caller goes
+  // poking at site-specific selectors (search box, cart UI, …). After a
+  // fresh browser launch the page is on about:blank, where every
+  // Frisco-specific locator times out.
+  let url = '';
+  try {
+    url = page.url();
+  } catch {
+    // page may be closed; let the caller re-open via getPage()
+  }
+  if (!url || !/^https?:\/\/(www\.)?frisco\.pl\b/i.test(url)) {
+    try {
+      await page.goto('https://www.frisco.pl/', { waitUntil: 'domcontentloaded', timeout: 20_000 });
+    } catch {
+      // Best-effort: a navigation failure here will surface naturally
+      // when the next selector lookup times out, with a more
+      // actionable error than a blank goto failure.
+    }
   }
 }
 

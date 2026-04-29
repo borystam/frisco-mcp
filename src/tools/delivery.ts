@@ -16,7 +16,10 @@
 import { getPage, getContext } from '../browser.js';
 import { ensureLoggedIn } from '../auth.js';
 
-const DELIVERY_URL = 'https://www.frisco.pl/stn,checkout-delivery';
+// Frisco moved the delivery-slot picker from /stn,checkout-delivery →
+// /stn,checkout (step 2 of the unified checkout flow) sometime before
+// 2026-04-29. The legacy URL silently 404s.
+const DELIVERY_URL = 'https://www.frisco.pl/stn,checkout';
 const NAV_TIMEOUT_MS = 25_000;
 const SETTLE_MS = 2_500;
 
@@ -199,7 +202,7 @@ export async function fetchDeliveryGrid(): Promise<DeliveryGrid> {
   const context = await getContext();
   await ensureLoggedIn(page, context);
 
-  if (!page.url().includes('checkout-delivery')) {
+  if (!page.url().includes('checkout')) {
     await page.goto(DELIVERY_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
   }
   await page.waitForTimeout(SETTLE_MS);

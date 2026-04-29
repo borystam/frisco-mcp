@@ -16,6 +16,26 @@ export function getLastSearchContext(): SearchContext | null {
   return _lastSearchContext;
 }
 
+// Module-level FIFO mutex around the singleton browser/page. Every tool
+// that touches the browser must run inside withPageLock; otherwise
+// concurrent callers race on the same Page object — the last navigate
+// wins and earlier callers parse the wrong DOM. The mutex spans MCP
+// sessions because the browser singleton itself is module-scoped.
+let _pageLock: Promise<unknown> = Promise.resolve();
+export async function withPageLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = _pageLock.catch(() => undefined);
+  let release!: () => void;
+  _pageLock = new Promise<void>((r) => {
+    release = r;
+  });
+  try {
+    await previous;
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
 export async function getPage(): Promise<Page> {
   if (_browser !== null && !_browser.isConnected()) {
     await closeBrowser();

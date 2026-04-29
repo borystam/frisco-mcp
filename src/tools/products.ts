@@ -8,7 +8,22 @@ import {
 } from './scoring.js';
 import type { Product, SearchResultItem } from '../types.js';
 
-export async function searchProducts(query: string, topN: number = 5): Promise<string> {
+// Bounds on topN. Below 1 is nonsensical; Frisco's own page caps at ~24,
+// so anything above that is wasted bandwidth.
+const TOPN_MIN = 1;
+const TOPN_MAX = 24;
+const TOPN_DEFAULT = 5;
+
+export function clampTopN(topN: number | undefined, fallback: number = TOPN_DEFAULT): number {
+  if (topN === undefined || !Number.isFinite(topN)) return fallback;
+  return Math.max(TOPN_MIN, Math.min(TOPN_MAX, Math.floor(topN)));
+}
+
+export async function searchProducts(query: string, topN: number = TOPN_DEFAULT): Promise<string> {
+  if (typeof query !== 'string' || query.trim().length === 0) {
+    return '❌ Search query is required (got empty string).';
+  }
+  const limit = clampTopN(topN);
   const page = await getPage();
   const context = await getContext();
   await ensureLoggedIn(page, context);
@@ -65,7 +80,7 @@ export async function searchProducts(query: string, topN: number = 5): Promise<s
 
         return { name, href, price, weight, available: !unavailable };
       });
-    }, topN)) as Array<{
+    }, limit)) as Array<{
       name: string;
       href: string | null;
       price: string;
@@ -213,8 +228,25 @@ export async function getProductInfo(query: string): Promise<string> {
 export async function searchProductsScored(
   query: string,
   criteria: ScoringCriteria,
-  topN: number = 5,
+  topN: number = TOPN_DEFAULT,
 ): Promise<string> {
+  if (typeof query !== 'string' || query.trim().length === 0) {
+    return '❌ Search query is required (got empty string).';
+  }
+  const effectiveTopN = clampTopN(topN);
+  // Sanity-check the criteria object: packSizeWeight > 0 without
+  // targetWeightGrams is a no-op that the user almost certainly didn't
+  // intend; surface it instead of silently scoring 0 for that component.
+  if (
+    criteria &&
+    typeof criteria.packSizeWeight === 'number' &&
+    criteria.packSizeWeight > 0 &&
+    (criteria.targetWeightGrams === undefined ||
+      !Number.isFinite(criteria.targetWeightGrams) ||
+      (criteria.targetWeightGrams ?? 0) <= 0)
+  ) {
+    return '❌ packSizeWeight > 0 requires targetWeightGrams (positive). Set both, or set packSizeWeight to 0.';
+  }
   const page = await getPage();
   const context = await getContext();
   await ensureLoggedIn(page, context);
@@ -319,7 +351,7 @@ export async function searchProductsScored(
     });
 
     const scored = scoreSearchResults(searchResults, criteria);
-    const formatted = formatScoredResults(query, scored, topN);
+    const formatted = formatScoredResults(query, scored, effectiveTopN);
     return `${formatted}\n\n🔗 Search URL: ${searchUrl}`;
   } catch (err) {
     return `❌ Search error: ${err instanceof Error ? err.message : String(err)}`;

@@ -1,4 +1,4 @@
-import { getPage, getContext, getLastSearchContext } from "../browser.js";
+import { getPage, getContext, getLastSearchContext, productCache } from "../browser.js";
 import { ensureLoggedIn } from "../auth.js";
 import {
   dismissPopups,
@@ -21,7 +21,18 @@ type CartSummaryItem = {
 
 type CartSnapshot = {
   items: CartSummaryItem[];
+  /** Final checkout total ("Do zapłaty"), incl. delivery + packaging. */
   total: string | null;
+  /** Items-only subtotal ("Koszyk (N produkty)") — what most callers
+   *  mean when they say "cart total". Distinct from `total` because the
+   *  agent will hallucinate explanations for the gap otherwise. */
+  itemsSubtotal: string | null;
+  /** Delivery fee, when surfaced separately on the cart page. */
+  deliveryFee: string | null;
+  /** Packaging fee. */
+  packagingFee: string | null;
+  /** Other named line items in the summary box, captured raw. */
+  otherCharges: string[];
 };
 
 function normalizeLookup(text: string): string {
@@ -277,11 +288,23 @@ async function addProductFromCurrentProductPage(
     };
   }
 
+  // Verify the click actually landed by reading the quantity input
+  // back. Frisco intermittently dismisses popups or otherwise eats the
+  // click — the button visibly clicks but no cart line appears. Without
+  // this check we'd report ✅ to the agent and the agent would tell the
+  // user "added" when nothing happened.
   const finalQty = await quantityInput
     .inputValue()
     .catch(() => null);
-
-  return { ok: true, reason: finalQty ? `quantity: ${finalQty}` : undefined };
+  const numericQty = finalQty ? Number(finalQty) : 0;
+  if (!finalQty || !Number.isFinite(numericQty) || numericQty <= 0) {
+    return {
+      ok: false,
+      reason:
+        "click went through but the product page's quantity input still reads 0 — the cart probably did not accept it (popup blocking? out-of-stock?). Re-run after dismissing popups, or fall back to the cart-page reconciliation",
+    };
+  }
+  return { ok: true, reason: `quantity: ${finalQty}` };
 }
 
 function pickResultForCartItem(
@@ -585,9 +608,63 @@ async function getCartSnapshot(
           '[class*="Summary"] [class*="Price"], [class*="CartSummary"]',
       );
 
+    // Parse the summary box, which Frisco renders as labelled rows like:
+    //   "Koszyk (2 produkty) 13,29 zł"   ← items subtotal
+    //   "Dostawa 14,00 zł"               ← delivery
+    //   "Koszt pakowania 5,50 zł"        ← packaging
+    //   "Do zapłaty 32,79 zł"            ← final total
+    // Without separating these out, callers see a 32,79 "Total" that
+    // doesn't match the visible item lines (13,29) and assume their cart
+    // is wrong. Bug F5 from the test report.
+    const summaryRowEls = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        ".generic-summary-box_frame-section-row",
+      ),
+    );
+
+    const PRICE_RE = /([\d\s]+[,.][\d]{1,2}\s*zł)/i;
+    function tailPrice(text: string): string | null {
+      const m = PRICE_RE.exec(text);
+      return m ? normalizeText(m[1]) : null;
+    }
+
+    let itemsSubtotal: string | null = null;
+    let deliveryFee: string | null = null;
+    let packagingFee: string | null = null;
+    const otherCharges: string[] = [];
+
+    for (const el of summaryRowEls) {
+      const txt = normalizeText(el.innerText);
+      const lower = txt.toLowerCase();
+      // "Koszyk (n produkt[y]) X,XX zł" → itemsSubtotal
+      if (/^koszyk\b/.test(lower) || /\bprodukt(y|ów)?\)/.test(lower)) {
+        itemsSubtotal = tailPrice(txt) ?? itemsSubtotal;
+      } else if (/^dostawa\b/.test(lower) || /\bdostaw[ay]\b/.test(lower)) {
+        deliveryFee = tailPrice(txt) ?? deliveryFee;
+      } else if (
+        /pakowani[ae]/.test(lower) ||
+        /opakowan/.test(lower) ||
+        /packag/.test(lower)
+      ) {
+        packagingFee = tailPrice(txt) ?? packagingFee;
+      } else if (/do\s*zapłaty/.test(lower) || /\btotal\b/.test(lower)) {
+        // Already captured by `totalRow` above; keep parity.
+      } else if (txt && tailPrice(txt)) {
+        // Capture any unknown line that has a price — surfaced raw so
+        // future Frisco changes (extra surcharge, promo line, …) are
+        // visible to the consumer instead of silently subsumed in the
+        // total.
+        otherCharges.push(txt);
+      }
+    }
+
     return {
       items: Array.from(byName.values()),
       total: totalElement ? normalizeText(totalElement.innerText) : null,
+      itemsSubtotal,
+      deliveryFee,
+      packagingFee,
+      otherCharges,
     };
   });
 }
@@ -602,8 +679,34 @@ function formatCartSnapshot(snapshot: CartSnapshot): string {
     const pricePart = item.price ? ` — ${item.price}` : "";
     lines.push(`- ${item.name} ×${item.qty}${pricePart}`);
   }
-  if (snapshot.total) {
-    lines.push(`\n💰 Total: ${snapshot.total}`);
+
+  // Items subtotal first (what the line items above sum to), then any
+  // extra fees Frisco surfaces, then the final to-pay. Keeping these
+  // separate stops agents from rationalising the gap between item-sum
+  // and final-total with hallucinated theories.
+  if (
+    snapshot.itemsSubtotal ||
+    snapshot.deliveryFee ||
+    snapshot.packagingFee ||
+    snapshot.otherCharges.length > 0 ||
+    snapshot.total
+  ) {
+    lines.push("");
+    if (snapshot.itemsSubtotal) {
+      lines.push(`💰 Items subtotal: ${snapshot.itemsSubtotal}`);
+    }
+    if (snapshot.deliveryFee) {
+      lines.push(`🚚 Delivery: ${snapshot.deliveryFee}`);
+    }
+    if (snapshot.packagingFee) {
+      lines.push(`📦 Packaging: ${snapshot.packagingFee}`);
+    }
+    for (const charge of snapshot.otherCharges) {
+      lines.push(`➕ ${charge}`);
+    }
+    if (snapshot.total) {
+      lines.push(`💳 Total to pay: ${snapshot.total}`);
+    }
   }
   lines.push(`\n👉 ${CART_URL}`);
   return lines.join("\n");
@@ -612,6 +715,16 @@ function formatCartSnapshot(snapshot: CartSnapshot): string {
 export async function clearCart(): Promise<string> {
   try {
     const page = await getReadyCartPage();
+    // Snapshot first: when the cart is already empty, Frisco doesn't
+    // render a clear-cart button at all, and the previous fall-through
+    // produced a misleading "layout may have changed" warning.
+    const before = await getCartSnapshot(page);
+    if (before.items.length === 0) {
+      return [
+        "🛒 Cart already empty — nothing to clear.",
+        formatCartSnapshot(before),
+      ].join("\n");
+    }
     const wasClicked = await clearCartViaUi(page);
     const snapshot = await getCartSnapshot(page);
     const summary = formatCartSnapshot(snapshot);
@@ -656,31 +769,149 @@ export interface AddItemProgressEvent {
 
 export type AddItemProgressCallback = (event: AddItemProgressEvent) => void;
 
+// Quantity-key aliases that small models (qwen3.6-class) commonly emit
+// instead of the documented "quantity". Normalising here saves one
+// retry round-trip per agent call — measured concretely against the
+// live qwen3.6:27b backing Hermes.
+const QUANTITY_ALIASES = ["qty", "amount", "count", "n"] as const;
+
+function normaliseCartItem(raw: unknown): { item: CartItem | null; warnings: string[] } {
+  const warnings: string[] = [];
+  if (raw === null || typeof raw !== "object") {
+    return { item: null, warnings: ["item must be an object"] };
+  }
+  const r = raw as Record<string, unknown>;
+  const item: CartItem = {
+    name: typeof r.name === "string" ? r.name : "",
+  };
+  // Quantity aliases — accept the most common LLM-emitted variants.
+  if (r.quantity === undefined) {
+    for (const alias of QUANTITY_ALIASES) {
+      if (r[alias] !== undefined) {
+        item.quantity = r[alias] as number;
+        warnings.push(`'${alias}' field aliased to 'quantity' — please pass 'quantity' next time`);
+        break;
+      }
+    }
+  } else {
+    item.quantity = r.quantity as number;
+  }
+  if (typeof r.productUrl === "string") item.productUrl = r.productUrl;
+  if (typeof r.searchQuery === "string") item.searchQuery = r.searchQuery;
+  return { item, warnings };
+}
+
 export async function addItemsToCart(
-  items: string,
+  items: string | unknown[],
   options: { clearCartFirst?: boolean; onProgress?: AddItemProgressCallback } = {},
 ): Promise<string> {
+  // Accept both stringified JSON (the documented contract) and a raw
+  // array — strict structured-output models will sometimes pass the
+  // array directly, ignoring the schema's `string` declaration.
   let products: CartItem[];
-  try {
-    products = JSON.parse(items) as CartItem[];
-  } catch {
-    return '❌ Invalid JSON. Expected: \'[{"name":"...","searchQuery":"...","quantity":1}]\'';
+  let raw: unknown;
+  if (Array.isArray(items)) {
+    raw = items;
+  } else if (typeof items === "string") {
+    try {
+      raw = JSON.parse(items);
+    } catch {
+      return '❌ Invalid JSON. Expected: \'[{"name":"...","searchQuery":"...","quantity":1}]\'';
+    }
+  } else {
+    return '❌ Invalid input. Expected a JSON array (or its stringified form).';
   }
-
-  if (!Array.isArray(products)) {
+  if (!Array.isArray(raw)) {
     return "❌ Invalid input. Expected a JSON array of products.";
   }
+  if (raw.length === 0) {
+    return "❌ Empty items array — pass at least one product.";
+  }
+  // Normalise each entry and collect alias warnings — they're appended
+  // once at the top of the response so the LLM learns the schema for
+  // the next call but the call still succeeds.
+  const aliasWarnings: string[] = [];
+  products = [];
+  for (let i = 0; i < raw.length; i++) {
+    const { item, warnings } = normaliseCartItem(raw[i]);
+    if (item) {
+      products.push(item);
+      for (const w of warnings) aliasWarnings.push(`item[${i}] ${w}`);
+    } else {
+      // Reject items that aren't even objects up front.
+      return `❌ Invalid input: item[${i}] ${warnings.join(", ")}`;
+    }
+  }
 
-  const needsSearchContext = products.some((product) => !product.productUrl);
-  const searchContext = needsSearchContext ? getLastSearchContext() : null;
+  // Quantity validation. Default missing → 1; reject 0, negatives, non-
+  // integers, NaN, and unreasonably high values up front so the user
+  // gets a clear schema-level error instead of Frisco's misleading
+  // "currently unavailable" downstream.
+  const QTY_MAX = 50;
+  const quantityErrors: string[] = [];
+  for (let i = 0; i < products.length; i++) {
+    const item = products[i];
+    if (!item || typeof item !== "object") {
+      quantityErrors.push(`item[${i}]: must be an object`);
+      continue;
+    }
+    if (typeof item.name !== "string" || item.name.trim().length === 0) {
+      quantityErrors.push(`item[${i}]: 'name' is required`);
+    }
+    if (item.quantity === undefined || item.quantity === null) {
+      item.quantity = 1;
+      continue;
+    }
+    if (
+      typeof item.quantity !== "number" ||
+      !Number.isFinite(item.quantity) ||
+      !Number.isInteger(item.quantity) ||
+      item.quantity <= 0
+    ) {
+      quantityErrors.push(
+        `item[${i}] (${item.name ?? "?"}): quantity must be a positive integer (got ${JSON.stringify(item.quantity)})`,
+      );
+      continue;
+    }
+    if (item.quantity > QTY_MAX) {
+      quantityErrors.push(
+        `item[${i}] (${item.name}): quantity ${item.quantity} exceeds max ${QTY_MAX}`,
+      );
+    }
+  }
+  if (quantityErrors.length > 0) {
+    return ["❌ Invalid input:", ...quantityErrors.map((e) => `   • ${e}`)].join(
+      "\n",
+    );
+  }
+
+  // We need *some* way to resolve each item's URL: explicit productUrl,
+  // a hit in productCache (accumulates across all searches in the
+  // session), or the latest search context. Only fail fast when none
+  // of those can possibly cover any item.
+  const cacheCanCover = (name: string | undefined): boolean => {
+    if (!name) return false;
+    if (productCache.has(name)) return true;
+    const wanted = name.toLowerCase();
+    for (const [k] of productCache.entries()) {
+      if (k.toLowerCase().includes(wanted) || wanted.includes(k.toLowerCase())) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const needsSearchContext = products.some(
+    (product) => !product.productUrl && !cacheCanCover(product.name),
+  );
+  const searchContext = getLastSearchContext();
   if (
     needsSearchContext &&
     (!searchContext || searchContext.results.length === 0)
   ) {
     return [
-      "❌ No saved search context found.",
-      "Run search_products first, then call add_items_to_cart with item names from that result list.",
-      "Or pass productUrl in each item to add directly from product pages.",
+      "❌ No way to resolve product URLs for some items.",
+      "Either: (a) call search_products / search_products_scored first so the item names are in the session cache, or",
+      "(b) pass productUrl in each item to add directly from product pages.",
     ].join("\n");
   }
 
@@ -697,13 +928,32 @@ export async function addItemsToCart(
 
   const results: string[] = [];
 
+  // Parallel structured per-item record. Used to reconcile against a
+  // post-loop cart snapshot: F2 races where Frisco's UI ate the
+  // success-confirmation but the item was added on the server side
+  // are upgraded from "warn" to "ok-recovered".
+  type Attempt = {
+    name: string;
+    quantity: number;
+    status: AddItemProgressEvent['status'];
+    resultIndex: number; // index into `results` so we can rewrite the line
+  };
+  const attempts: Attempt[] = [];
+
   const emit = (
     item: CartItem,
     indexZero: number,
     status: AddItemProgressEvent['status'],
     message: string,
   ) => {
+    const resultIndex = results.length;
     results.push(message);
+    attempts.push({
+      name: item.name ?? "?",
+      quantity: typeof item.quantity === "number" ? item.quantity : 1,
+      status,
+      resultIndex,
+    });
     if (options.onProgress) {
       try {
         options.onProgress({
@@ -729,7 +979,29 @@ export async function addItemsToCart(
         : 1;
 
     try {
-      const explicitUrl = item.productUrl?.trim();
+      // If the item has no productUrl, try the persistent productCache
+      // before requiring a fresh search context. Multi-search workflows
+      // (search milk, search bread, search butter, then add all at
+      // once) otherwise fail because only the LAST searchContext is
+      // available; the cache, however, accumulates {name → URL} from
+      // every prior search in the session.
+      let explicitUrl = item.productUrl?.trim();
+      if (!explicitUrl && item.name) {
+        const cached = productCache.get(item.name);
+        if (cached?.url) explicitUrl = cached.url;
+        // Also try a case-insensitive partial match — agents often
+        // shorten a long product title (full brand + variant + size) to
+        // a shorter agent-friendly form when calling add_items_to_cart.
+        if (!explicitUrl) {
+          const wanted = item.name.toLowerCase();
+          for (const [k, v] of productCache.entries()) {
+            if (v.url && (k.toLowerCase().includes(wanted) || wanted.includes(k.toLowerCase()))) {
+              explicitUrl = v.url;
+              break;
+            }
+          }
+        }
+      }
       if (explicitUrl) {
         if (!isSameProductUrl(page.url(), explicitUrl)) {
           await page.goto(explicitUrl, { waitUntil: "domcontentloaded" });
@@ -884,11 +1156,78 @@ export async function addItemsToCart(
     }
   }
 
+  // F2 reconciliation, upgrade-only direction:
+  //  • warn → ok-recovered when the cart actually has the item — Frisco
+  //    sometimes eats the click-success signal but lands the add anyway.
+  //
+  // We deliberately do NOT downgrade ok → warn here. The cart page
+  // takes a few seconds to reflect a fresh add (Frisco's
+  // server→client propagation is async); a snapshot taken immediately
+  // can show "empty" even when the add succeeded. The trustworthy
+  // success signal lives upstream: addProductFromCurrentProductPage
+  // now verifies the product-page quantity input is > 0 before
+  // returning ok. Trust that.
+  const recoveredNames: string[] = [];
+  if (attempts.some((a) => a.status === "warn")) {
+    try {
+      const snap = await getCartSnapshot(page);
+      const inCart = (needle: string): { name: string; qty: string } | null => {
+        const wanted = needle.toLowerCase();
+        for (const entry of snap.items) {
+          const have = entry.name.toLowerCase();
+          if (have === wanted || have.includes(wanted) || wanted.includes(have)) {
+            return entry;
+          }
+        }
+        return null;
+      };
+      for (const a of attempts) {
+        if (a.status !== "warn") continue;
+        const found = inCart(a.name);
+        if (found) {
+          a.status = "ok";
+          results[a.resultIndex] =
+            `✅ ${found.name} ×${found.qty} (recovered: tool-side click race; cart confirms it landed)`;
+          recoveredNames.push(found.name);
+        }
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
   const addedCount = results.filter((line) => line.startsWith("✅")).length;
+  const aliasBanner =
+    aliasWarnings.length > 0
+      ? [
+          "ℹ️ Schema notes:",
+          ...aliasWarnings.map((w) => `   • ${w}`),
+          "",
+        ]
+      : [];
+  const recoveryBanner =
+    recoveredNames.length > 0
+      ? [
+          "",
+          "ℹ️ Reconciliation note: the click reported failure for some items but the cart shows they landed (Frisco UI race).",
+        ]
+      : [];
+  // Chain hint: keep the agent honest. After a cart write, the next
+  // call should be view_cart to verify ground truth — not a status
+  // announcement, not a final message. This line gets the model's
+  // attention and lifts long-horizon completion rates.
+  const nextStepHint =
+    addedCount === products.length
+      ? "✅ NEXT: call view_cart to confirm the items landed and surface the totals to the user."
+      : "⚠️ NEXT: call view_cart now — some items may have landed despite the failure messages above (Frisco UI race). The cart is the source of truth.";
   return [
     `🛒 Added ${addedCount}/${products.length} items:`,
     "",
+    ...aliasBanner,
     results.join("\n"),
+    ...recoveryBanner,
+    "",
+    nextStepHint,
     "",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     "⚠️ Payment is YOUR responsibility.",
@@ -984,7 +1323,12 @@ export async function removeItemFromCart(productName: string): Promise<string> {
     }
 
     await page.waitForTimeout(1_000);
-    return `🗑️ Removed "${removedName}" from cart.\n👉 ${CART_URL}`;
+    return [
+      `🗑️ Removed "${removedName}" from cart.`,
+      `👉 ${CART_URL}`,
+      ``,
+      `NEXT: call view_cart to confirm the cart now reflects the removal.`,
+    ].join("\n");
   } catch (error) {
     return `❌ Failed to remove item: ${getErrorMessage(error)}`;
   }
@@ -1055,23 +1399,112 @@ export async function updateItemQuantity(
       return `⚠️ Product "${productName}" was not found in the cart.`;
     }
 
-    const quantityInput = page
-      .locator(
-        `.mini-product-box_wrapper.in-cart:has(a[title*="${foundName}" i]) .cart-button_quantity`,
-      )
-      .first();
+    // F1 fix: Frisco's selector with `:has(a[title*=... i])` was
+    // missing the quantity input even when it existed (Polish chars +
+    // punctuation in the title attribute didn't survive Playwright's
+    // selector parser). Drive the fill via page.evaluate, scoped to
+    // the matching cart row by name.lower-includes — same pattern the
+    // cart-parser successfully uses elsewhere.
+    type FillResult =
+      | { kind: "filled"; before: string | null; after: string | null }
+      | { kind: "no-input"; currentQty: string | null }
+      | { kind: "no-row" };
 
+    const fillResult = await page.evaluate(
+      ({ target, qty }: { target: string; qty: number }): FillResult => {
+        const boxes = Array.from(
+          document.querySelectorAll<HTMLElement>(
+            ".mini-product-box_wrapper.in-cart, article.horizontal-product-box__wrapper",
+          ),
+        );
+        for (const box of boxes) {
+          const nameLink = box.querySelector<HTMLAnchorElement>("a[title]");
+          const titledImg = box.querySelector<HTMLImageElement>("img[title]");
+          const haystack = (
+            (nameLink?.title ?? "") +
+            " " +
+            (titledImg?.title ?? "")
+          ).toLowerCase();
+          if (!haystack.includes(target)) continue;
+          const qInput = box.querySelector<HTMLInputElement>(
+            "input.cart-button_quantity, input[type='number']",
+          );
+          if (!qInput) {
+            return { kind: "no-input", currentQty: null };
+          }
+          const before = qInput.value;
+          // Native setter to bypass React's value-tracker (Frisco uses
+          // React; a naïve .value = X is silently reverted).
+          const proto = Object.getPrototypeOf(qInput) as { __proto__?: object };
+          const setter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            "value",
+          )?.set;
+          if (setter) {
+            setter.call(qInput, String(qty));
+          } else {
+            qInput.value = String(qty);
+          }
+          // Dispatch the events React listens for (input + change).
+          qInput.dispatchEvent(new Event("input", { bubbles: true }));
+          qInput.dispatchEvent(new Event("change", { bubbles: true }));
+          // Trigger Frisco's per-row handlers.
+          qInput.blur();
+          void proto;
+          return { kind: "filled", before, after: qInput.value };
+        }
+        return { kind: "no-row" };
+      },
+      { target: needle, qty: quantity },
+    );
+
+    if (fillResult.kind === "no-row") {
+      return `⚠️ Product "${productName}" was not found in the cart (post-locate check failed).`;
+    }
+    if (fillResult.kind === "no-input") {
+      return `⚠️ Cannot change quantity for "${foundName}" — quantity input was not found in the cart row.`;
+    }
     if (
-      !(await quantityInput.isVisible({ timeout: 3_000 }).catch(() => false))
+      fillResult.before &&
+      Number(fillResult.before) === quantity
     ) {
-      return `⚠️ Cannot change quantity for "${foundName}" — quantity input was not found.`;
+      return `✅ Quantity for "${foundName}" was already ${quantity}.\n👉 ${CART_URL}`;
     }
 
-    await quantityInput.fill(String(quantity));
-    await quantityInput.press("Enter");
+    // Give Frisco a moment to round-trip the change, then re-read.
     await page.waitForTimeout(1_500);
+    const finalQty = await page.evaluate((target: string) => {
+      const boxes = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          ".mini-product-box_wrapper.in-cart, article.horizontal-product-box__wrapper",
+        ),
+      );
+      for (const box of boxes) {
+        const nameLink = box.querySelector<HTMLAnchorElement>("a[title]");
+        const titledImg = box.querySelector<HTMLImageElement>("img[title]");
+        const haystack = (
+          (nameLink?.title ?? "") +
+          " " +
+          (titledImg?.title ?? "")
+        ).toLowerCase();
+        if (!haystack.includes(target)) continue;
+        const qInput = box.querySelector<HTMLInputElement>(
+          "input.cart-button_quantity, input[type='number']",
+        );
+        return qInput?.value ?? null;
+      }
+      return null;
+    }, needle);
 
-    return `✅ Quantity for "${foundName}" changed to ${quantity}.\n👉 ${CART_URL}`;
+    if (finalQty && Number(finalQty) === quantity) {
+      return [
+        `✅ Quantity for "${foundName}" changed to ${quantity} (was ${fillResult.before ?? "?"}).`,
+        `👉 ${CART_URL}`,
+        ``,
+        `NEXT: call view_cart to confirm the new totals.`,
+      ].join("\n");
+    }
+    return `⚠️ Quantity change for "${foundName}" did not stick — cart still shows ${finalQty ?? "?"} (expected ${quantity}). NEXT: call remove_item_from_cart for "${foundName}" then add_items_to_cart with the desired quantity.`;
   } catch (error) {
     return `❌ Failed to update quantity: ${getErrorMessage(error)}`;
   }

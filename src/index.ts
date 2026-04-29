@@ -2,6 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { runHttp, readEnvOptions, type RunningHttpServer } from "./http-server.js";
+import { closeBrowser, withPageLock } from "./browser.js";
+
 import { login, finishSession, clearSession } from "./tools/session.js";
 import {
   addItemsToCart,
@@ -19,7 +22,7 @@ import {
   getProductReviews,
 } from "./tools/products.js";
 import { getDeliverySlots } from "./tools/delivery.js";
-import { getOrderHistory } from "./tools/orders.js";
+import { getOrderHistory, getOrderDetails } from "./tools/orders.js";
 import {
   initLogger,
   logEvent,
@@ -29,15 +32,30 @@ import {
   tailLogs,
 } from "./logger.js";
 
-const server = new McpServer({
-  name: "frisco-mcp-ts",
-  version: "1.0.0",
-});
+// Tool registration is shared between the stdio singleton (long-lived) and
+// the per-session McpServer instances created by the HTTP transport. The
+// SDK's protocol layer cannot service multiple concurrent initialize
+// handshakes on a single McpServer, so the HTTP path builds a fresh server
+// per session via createServer().
+export function createServer(): McpServer {
+  const s = new McpServer({
+    name: "frisco-mcp-ts",
+    version: "1.0.0",
+  });
+  registerAllTools(s);
+  return s;
+}
+
+function registerAllTools(server: McpServer): void {
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
 };
+
+// Tools that don't touch the browser — safe to run outside the lock so
+// log readers don't block on a long-running login or cart op.
+const NON_BROWSER_TOOLS = new Set(["get_logs", "tail_logs"]);
 
 async function executeTool(
   toolName: string,
@@ -47,7 +65,10 @@ async function executeTool(
   const startedAt = Date.now();
   await logEvent("tool_started", { toolName, input });
   try {
-    const text = await run();
+    const guarded = NON_BROWSER_TOOLS.has(toolName)
+      ? run
+      : (): Promise<string> => withPageLock(run);
+    const text = await guarded();
     await logEvent("tool_succeeded", {
       toolName,
       durationMs: Date.now() - startedAt,
@@ -176,10 +197,23 @@ server.registerTool(
     description:
       "Adds products to cart by selecting from the most recent search_products result page. No additional search is performed.",
     inputSchema: {
+      // Accept both the documented stringified-JSON form (small models
+      // tend to honour the `string` declaration) and the raw array
+      // form (strict structured-output models often pass through).
       items: z
-        .string()
+        .union([
+          z.string(),
+          z.array(
+            z.object({
+              name: z.string(),
+              quantity: z.number().optional(),
+              productUrl: z.string().optional(),
+              searchQuery: z.string().optional(),
+            }).passthrough(),
+          ),
+        ])
         .describe(
-          'JSON array of items, e.g. [{"name":"PIĄTNICA Skyr naturalny","quantity":2}] or [{"name":"...","productUrl":"https://www.frisco.pl/pid,...","quantity":1}]',
+          'Array of items (or its stringified JSON form), e.g. [{"name":"<exact name from search results>","quantity":2}] or [{"name":"...","productUrl":"https://www.frisco.pl/pid,...","quantity":1}]',
         ),
       clearCartFirst: z
         .boolean()
@@ -458,7 +492,7 @@ server.registerTool(
   "get_order_history",
   {
     description:
-      "Reads the user's past Frisco orders from /stn,user-orders and returns a summary list (order ID, placed-at, status, total) plus a spend total. Optional filters: fromDate, toDate (ISO YYYY-MM-DD), status substring, minTotalPln, limit.",
+      "Reads the user's past Frisco orders from /stn,settings/sub,history and returns a summary list (order ID, placed-at, status, total) plus a spend total. Optional filters: fromDate, toDate (ISO YYYY-MM-DD), status substring, minTotalPln, limit.",
     inputSchema: {
       fromDate: z
         .string()
@@ -497,15 +531,98 @@ server.registerTool(
   },
 );
 
-async function run() {
+server.registerTool(
+  "get_order_details",
+  {
+    description:
+      "Returns the line items of a single past Frisco order: brand, product name, size, quantity, price, and promo flag, grouped by category. Pass the order id from get_order_history (either the long form '1640647/260008' or just the trailing '260008'). Use this to build a 'staples checklist' from past orders or to compare two shops.",
+    inputSchema: {
+      orderId: z
+        .string()
+        .min(6)
+        .describe(
+          "Order id from get_order_history. Long form '1640647/260008' or short '260008' both accepted.",
+        ),
+    },
+  },
+  async ({ orderId }) => {
+    return executeTool("get_order_details", { orderId }, () =>
+      getOrderDetails(orderId),
+    );
+  },
+);
+} // end registerAllTools
+
+const SHUTDOWN_BUDGET_MS = 10_000;
+
+interface RunningServer {
+  close: () => Promise<void>;
+}
+
+async function run(): Promise<void> {
   await initLogger();
+  const transportName = (process.env.MCP_TRANSPORT ?? "stdio").trim().toLowerCase();
   await logEvent("server_starting", {
     sessionId: getCurrentSessionId(),
     sessionLogPath: getCurrentSessionLogPath(),
+    transport: transportName,
   });
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+
+  let running: RunningServer;
+  if (transportName === "http") {
+    const opts = readEnvOptions();
+    const r: RunningHttpServer = await runHttp(createServer, opts);
+    running = { close: () => r.close() };
+  } else if (transportName === "stdio" || transportName === "") {
+    const stdio = new StdioServerTransport();
+    const stdioServer = createServer();
+    await stdioServer.connect(stdio);
+    running = { close: async () => stdioServer.close() };
+  } else {
+    throw new Error(
+      `MCP_TRANSPORT must be 'stdio' or 'http', got ${JSON.stringify(transportName)}`,
+    );
+  }
+
+  installSignalHandlers(running);
   await logEvent("server_started");
+}
+
+function installSignalHandlers(running: RunningServer): void {
+  let shuttingDown = false;
+  const handle = (signal: NodeJS.Signals): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void shutdown(signal, running);
+  };
+  process.once("SIGTERM", handle);
+  process.once("SIGINT", handle);
+}
+
+async function shutdown(signal: string, running: RunningServer): Promise<void> {
+  const deadline = Date.now() + SHUTDOWN_BUDGET_MS;
+  const hardExit = setTimeout(() => {
+    process.stderr.write(`[frisco-mcp] shutdown deadline exceeded on ${signal}, forcing exit\n`);
+    process.exit(1);
+  }, SHUTDOWN_BUDGET_MS);
+  hardExit.unref();
+  try {
+    await logEvent("server_stopping", { signal });
+    await running.close();
+    const browserBudget = Math.max(1_000, deadline - Date.now());
+    await Promise.race([
+      closeBrowser(),
+      new Promise<void>((resolve) => setTimeout(resolve, browserBudget).unref()),
+    ]);
+    await logEvent("server_stopped", { signal });
+  } catch (err) {
+    process.stderr.write(
+      `[frisco-mcp] shutdown error: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  } finally {
+    clearTimeout(hardExit);
+    process.exit(0);
+  }
 }
 
 run().catch((error) => {
@@ -516,6 +633,6 @@ run().catch((error) => {
     },
     "error",
   );
-  console.error("Fatal error starting server:", error);
+  process.stderr.write(`[frisco-mcp] fatal: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);
 });

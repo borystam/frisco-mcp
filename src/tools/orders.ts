@@ -448,15 +448,23 @@ export function parseOrderDetailSection(
   const flush = (): void => {
     if (buf.length === 0) return;
 
-    // Drop a leading "Promocja" badge line.
+    // Drop noise lines that appear AROUND a real item but aren't part
+    // of its identity:
+    //  - "Przydatny do …" / "Przydatny ok." — best-before info from
+    //    the previous item that landed in this chunk.
+    //  - "Promocja" — promo banner for THIS item.
+    //  - "Aktywuj promocję" / "X zł/szt. kupując N szt." — multi-buy
+    //    promo overlay text from before the brand line.
+    //  - "friscontowa cena" / "friscowa cena" — Frisco-Today badge.
     let promo = false;
-    if (buf[0]?.toLowerCase() === 'promocja') {
-      promo = true;
-      buf = buf.slice(1);
-    }
-    // Drop trailing "Przydatny do …" / "Przydatny ok." lines belonging
-    // to the previous item but inside this same chunk (rare).
-    buf = buf.filter(l => !/^przydatny\b/i.test(l));
+    buf = buf.filter(l => {
+      if (/^przydatny\b/i.test(l)) return false;
+      if (/^promocja$/i.test(l)) { promo = true; return false; }
+      if (/aktywuj\s+promocj/i.test(l)) { promo = true; return false; }
+      if (/kupując\s+\d+\s*szt/i.test(l)) { promo = true; return false; }
+      if (/frisco\w*\s*cena/i.test(l)) { promo = true; return false; }
+      return true;
+    });
 
     if (buf.length < 2) {
       buf = [];

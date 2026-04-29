@@ -257,4 +257,82 @@ describe('parseOrderDetailSection', () => {
   it('returns an empty list for empty input', () => {
     expect(parseOrderDetailSection('Inne', '')).toEqual([]);
   });
+
+  it('strips multi-line promo banners that precede the brand', () => {
+    // Multi-buy promos render as a banner block ABOVE the brand line:
+    //   "X zł/szt. kupując N szt."
+    //   "Aktywuj promocję"
+    //   BRAND
+    //   ...
+    // Without the filter the parser treated the banner text as the brand.
+    const promoBanner = [
+      '7.29 zł/szt. kupując 2 szt.',
+      'Aktywuj promocję',
+      'BRAND-E',
+      'Test product epsilon',
+      '1.5 l',
+      '4,79 zł/l',
+      'Cena',
+      '7,19 zł',
+      '1',
+      '0,00 zł',
+      'Usuń',
+    ].join('\n');
+    const items = parseOrderDetailSection('Oferta specjalna', promoBanner);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      brand: 'BRAND-E',
+      name: 'Test product epsilon',
+      size: '1.5 l',
+      promo: true,
+      quantity: 1,
+    });
+  });
+
+  it('strips friscowa-cena badge before the brand', () => {
+    const friscoBadge = [
+      'friscowa cena',
+      'BRAND-F',
+      'Test product zeta',
+      '250 g',
+      '37,16 zł/kg',
+      'Cena',
+      '9,29 zł',
+      '1',
+      '0,00 zł',
+      'Usuń',
+    ].join('\n');
+    const items = parseOrderDetailSection('Warzywa', friscoBadge);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      brand: 'BRAND-F',
+      name: 'Test product zeta',
+      promo: true,
+    });
+  });
+
+  it('drops trailing Przydatny line that bled in from previous item', () => {
+    // Real-world: when items are split by "Usuń", the next chunk
+    // starts with the previous item's "Przydatny ok. 5 dni" trailer.
+    // Make sure that doesn't get treated as the brand.
+    const withTrailer = [
+      'Przydatny ok. 5 dni',
+      'BRAND-G',
+      'Test product eta',
+      '500 g',
+      '39,18 zł/kg',
+      'Cena',
+      '19,59 zł',
+      '2',
+      '0,00 zł',
+      'Usuń',
+    ].join('\n');
+    const items = parseOrderDetailSection('Mięso', withTrailer);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      brand: 'BRAND-G',
+      name: 'Test product eta',
+      quantity: 2,
+    });
+  });
 });

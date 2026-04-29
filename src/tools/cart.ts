@@ -21,7 +21,18 @@ type CartSummaryItem = {
 
 type CartSnapshot = {
   items: CartSummaryItem[];
+  /** Final checkout total ("Do zapłaty"), incl. delivery + packaging. */
   total: string | null;
+  /** Items-only subtotal ("Koszyk (N produkty)") — what most callers
+   *  mean when they say "cart total". Distinct from `total` because the
+   *  agent will hallucinate explanations for the gap otherwise. */
+  itemsSubtotal: string | null;
+  /** Delivery fee, when surfaced separately on the cart page. */
+  deliveryFee: string | null;
+  /** Packaging fee. */
+  packagingFee: string | null;
+  /** Other named line items in the summary box, captured raw. */
+  otherCharges: string[];
 };
 
 function normalizeLookup(text: string): string {
@@ -585,9 +596,63 @@ async function getCartSnapshot(
           '[class*="Summary"] [class*="Price"], [class*="CartSummary"]',
       );
 
+    // Parse the summary box, which Frisco renders as labelled rows like:
+    //   "Koszyk (2 produkty) 13,29 zł"   ← items subtotal
+    //   "Dostawa 14,00 zł"               ← delivery
+    //   "Koszt pakowania 5,50 zł"        ← packaging
+    //   "Do zapłaty 32,79 zł"            ← final total
+    // Without separating these out, callers see a 32,79 "Total" that
+    // doesn't match the visible item lines (13,29) and assume their cart
+    // is wrong. Bug F5 from the test report.
+    const summaryRowEls = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        ".generic-summary-box_frame-section-row",
+      ),
+    );
+
+    const PRICE_RE = /([\d\s]+[,.][\d]{1,2}\s*zł)/i;
+    function tailPrice(text: string): string | null {
+      const m = PRICE_RE.exec(text);
+      return m ? normalizeText(m[1]) : null;
+    }
+
+    let itemsSubtotal: string | null = null;
+    let deliveryFee: string | null = null;
+    let packagingFee: string | null = null;
+    const otherCharges: string[] = [];
+
+    for (const el of summaryRowEls) {
+      const txt = normalizeText(el.innerText);
+      const lower = txt.toLowerCase();
+      // "Koszyk (n produkt[y]) X,XX zł" → itemsSubtotal
+      if (/^koszyk\b/.test(lower) || /\bprodukt(y|ów)?\)/.test(lower)) {
+        itemsSubtotal = tailPrice(txt) ?? itemsSubtotal;
+      } else if (/^dostawa\b/.test(lower) || /\bdostaw[ay]\b/.test(lower)) {
+        deliveryFee = tailPrice(txt) ?? deliveryFee;
+      } else if (
+        /pakowani[ae]/.test(lower) ||
+        /opakowan/.test(lower) ||
+        /packag/.test(lower)
+      ) {
+        packagingFee = tailPrice(txt) ?? packagingFee;
+      } else if (/do\s*zapłaty/.test(lower) || /\btotal\b/.test(lower)) {
+        // Already captured by `totalRow` above; keep parity.
+      } else if (txt && tailPrice(txt)) {
+        // Capture any unknown line that has a price — surfaced raw so
+        // future Frisco changes (extra surcharge, promo line, …) are
+        // visible to the consumer instead of silently subsumed in the
+        // total.
+        otherCharges.push(txt);
+      }
+    }
+
     return {
       items: Array.from(byName.values()),
       total: totalElement ? normalizeText(totalElement.innerText) : null,
+      itemsSubtotal,
+      deliveryFee,
+      packagingFee,
+      otherCharges,
     };
   });
 }
@@ -602,8 +667,34 @@ function formatCartSnapshot(snapshot: CartSnapshot): string {
     const pricePart = item.price ? ` — ${item.price}` : "";
     lines.push(`- ${item.name} ×${item.qty}${pricePart}`);
   }
-  if (snapshot.total) {
-    lines.push(`\n💰 Total: ${snapshot.total}`);
+
+  // Items subtotal first (what the line items above sum to), then any
+  // extra fees Frisco surfaces, then the final to-pay. Keeping these
+  // separate stops agents from rationalising the gap between item-sum
+  // and final-total with hallucinated theories.
+  if (
+    snapshot.itemsSubtotal ||
+    snapshot.deliveryFee ||
+    snapshot.packagingFee ||
+    snapshot.otherCharges.length > 0 ||
+    snapshot.total
+  ) {
+    lines.push("");
+    if (snapshot.itemsSubtotal) {
+      lines.push(`💰 Items subtotal: ${snapshot.itemsSubtotal}`);
+    }
+    if (snapshot.deliveryFee) {
+      lines.push(`🚚 Delivery: ${snapshot.deliveryFee}`);
+    }
+    if (snapshot.packagingFee) {
+      lines.push(`📦 Packaging: ${snapshot.packagingFee}`);
+    }
+    for (const charge of snapshot.otherCharges) {
+      lines.push(`➕ ${charge}`);
+    }
+    if (snapshot.total) {
+      lines.push(`💳 Total to pay: ${snapshot.total}`);
+    }
   }
   lines.push(`\n👉 ${CART_URL}`);
   return lines.join("\n");

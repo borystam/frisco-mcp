@@ -16,8 +16,11 @@ screenshots
 *.webp
 *.har
 
-# Local-only test fixtures.
-test_data/personal
+# Test fixtures + unit tests — not used at runtime, kept out of the
+# build context so `dist/` stays small and builds are faster for
+# downstream consumers.
+test_data
+**/__tests__
 
 # Editor + OS noise.
 .git
